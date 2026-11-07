@@ -9,7 +9,9 @@
 // The real Discord Gateway socket lifecycle is NOT exercised here:
 // Miniflare cannot stand in for Discord's gateway, so the op-code
 // handling is covered at the pure-function level instead (see
-// handleGatewayPayload / heartbeatDecision / reconnectDecisionForClose).
+// handleGatewayPayload / heartbeatDecision / reconnectDecisionForClose),
+// and socket acquisition at the helper level (openGatewaySocket with a
+// fake fetch: a Node-side outbound mock cannot mint a WebSocket).
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -619,6 +621,34 @@ test("pure: patchBotAvatar PATCHes @me with a data-URI avatar", async () => {
   assert.equal(
     JSON.parse(seen.init.body).avatar,
     "data:image/png;base64,QUJD"
+  );
+});
+
+// ---------- gateway socket acquisition (pure, fake fetch) ----------
+
+test("pure: openGatewaySocket returns the socket from a 101 upgrade response", async () => {
+  const fakeSocket = { readyState: 1 };
+  const calls = [];
+  const fakeFetch = async (url, init) => {
+    calls.push({ url, init });
+    return { status: 101, webSocket: fakeSocket };
+  };
+  const ws = await pure.openGatewaySocket(
+    fakeFetch,
+    "wss://gateway.discord.gg/?v=10&encoding=json"
+  );
+  assert.equal(ws, fakeSocket);
+  assert.equal(calls.length, 1);
+  // fetch() refuses wss: URLs, so the helper upgrades over https:.
+  assert.equal(calls[0].url, "https://gateway.discord.gg/?v=10&encoding=json");
+  assert.equal(calls[0].init.headers.Upgrade, "websocket");
+});
+
+test("pure: openGatewaySocket throws with the HTTP status when the upgrade fails", async () => {
+  const fakeFetch = async () => ({ status: 403, webSocket: null });
+  await assert.rejects(
+    () => pure.openGatewaySocket(fakeFetch, "wss://gateway.discord.gg/"),
+    /gateway upgrade failed: HTTP 403/
   );
 });
 

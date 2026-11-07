@@ -5,6 +5,10 @@
 // Discord Gateway, using WebSocket hibernation: the socket is registered
 // with ctx.acceptWebSocket(), so the object can sleep between events and
 // still be woken by Discord traffic, heartbeats and reconnect alarms.
+// The outbound socket itself is opened with fetch() and an Upgrade
+// header (the Workers client pattern — there is no usable
+// new WebSocket(url) client constructor, and fetch() refuses wss:
+// URLs, so openGatewaySocket() normalizes the scheme to https:).
 //
 // Inbound: MESSAGE_CREATE events that are DMs to the bot, or that mention
 // the bot in a guild channel, are forwarded to the dots-events server as
@@ -40,7 +44,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 const SERVICE_NAME = "discord-gateway";
-const SERVICE_VERSION = "0.2.0";
+const SERVICE_VERSION = "0.3.0";
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const DEFAULT_GATEWAY_URL = "wss://gateway.discord.gg";
 const CLAUDE_HOOK_URL = "https://dots-events.0g0.xyz/claude-hook";
@@ -532,6 +536,32 @@ function withGatewayParams(rawUrl) {
   return url.toString();
 }
 
+// Open the outbound gateway socket and return it. Workers has no
+// usable `new WebSocket(url)` client constructor; the supported
+// client pattern is an HTTP Upgrade handshake through fetch(), whose
+// response carries the socket as `response.webSocket` on a 101.
+// fetch() also refuses wss: URLs outright ("Fetch API cannot load"),
+// so the scheme is normalized (wss: -> https:, ws: -> http:) — the
+// gateway endpoint is an HTTPS endpoint that upgrades. The fetch
+// implementation is a parameter so tests can inject fake upgrade
+// responses. The caller (inside the Durable Object) registers the
+// returned socket with ctx.acceptWebSocket() for hibernation.
+export async function openGatewaySocket(fetchImpl, url) {
+  const upgradeUrl = String(url)
+    .replace(/^wss:/i, "https:")
+    .replace(/^ws:/i, "http:");
+  const res = await fetchImpl(upgradeUrl, {
+    headers: { Upgrade: "websocket" },
+  });
+  const ws = res ? res.webSocket : null;
+  if (!ws) {
+    throw new Error(
+      "gateway upgrade failed: HTTP " + (res ? res.status : "no response")
+    );
+  }
+  return ws;
+}
+
 // Test-only access to the non-function values above (the Workers runtime
 // requires every named export of the main module to be a function or a
 // handler class, so constants/objects cannot be exported directly).
@@ -740,7 +770,7 @@ export class Gateway extends DurableObject {
     state.reconnectAttempts = (state.reconnectAttempts || 0) + 1;
     const url = await this.gatewayUrlForConnect(state);
     try {
-      const ws = new WebSocket(url);
+      const ws = await openGatewaySocket(fetch, url);
       this.ctx.acceptWebSocket(ws, ["discord"]);
       state.connected = true;
       state.ready = false;

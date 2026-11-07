@@ -25,18 +25,22 @@
 //   GATEWAY             — Durable Object namespace (class Gateway)
 //   DISCORD_BOT_TOKEN   — secret; Discord bot token
 //   CLAUDE_HOOK_SECRET  — secret; whsec_ HMAC secret for /claude-hook
-//   ADMIN_KEY           — secret; key for POST /connect and POST /send
+//   ADMIN_KEY           — secret; key for POST /connect, /send, /avatar
 //
 // HTTP routes:
 //   GET  /         service info (name / version)
 //   GET  /status   public; exactly {"connected": bool, "ready": bool}
-//   POST /connect  admin key; nudge the Durable Object to (re)connect
+//   POST /connect  admin key; nudge the Durable Object to (re)connect;
+//                  the response carries admin-only diagnostics
+//                  {connected, ready, lastError, hasSession, lastDispatchAt}
 //   POST /send     admin key; {"channel_id", "content"} -> Discord REST
+//   POST /avatar   admin key; {"image_base64"} or {"image_url"} ->
+//                  PATCH the bot's own avatar via Discord REST
 
 import { DurableObject } from "cloudflare:workers";
 
 const SERVICE_NAME = "discord-gateway";
-const SERVICE_VERSION = "0.1.0";
+const SERVICE_VERSION = "0.2.0";
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const DEFAULT_GATEWAY_URL = "wss://gateway.discord.gg";
 const CLAUDE_HOOK_URL = "https://dots-events.0g0.xyz/claude-hook";
@@ -626,6 +630,22 @@ export class Gateway extends DurableObject {
     return { connected, ready: connected && state.ready };
   }
 
+  // Admin-only view: statusSnapshot() plus the recorded failure state,
+  // so an operator holding the admin key can see WHY a connect attempt
+  // is not landing (missing secrets, gateway lookup failure, close code
+  // guidance, ...). Relayed only by the admin-gated POST /connect; the
+  // public GET /status keeps returning exactly {connected, ready}.
+  diagnosticsSnapshot() {
+    const state = this.loadState();
+    return {
+      ...this.statusSnapshot(),
+      lastError: state.lastError ?? null,
+      hasSession:
+        typeof state.sessionId === "string" && state.sessionId !== null,
+      lastDispatchAt: state.lastDispatchAt ?? null,
+    };
+  }
+
   async scheduleAlarmLocked(state) {
     const now = Date.now();
     const candidates = [];
@@ -653,8 +673,8 @@ export class Gateway extends DurableObject {
     }
     if (url.pathname === "/internal/connect" && request.method === "POST") {
       return this.runLocked(async () => {
-        const status = await this.connectLocked();
-        return jsonResponse(status);
+        await this.connectLocked();
+        return jsonResponse(this.diagnosticsSnapshot());
       });
     }
     return new Response("not found", { status: 404 });
@@ -1175,6 +1195,188 @@ function sleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ---------- bot avatar (pure helpers + admin endpoint) ----------
+
+const MAX_AVATAR_BYTES = 8 * 1024 * 1024; // task-side cap for one avatar image
+
+// Media type for an avatar image: magic bytes win; the URL (or a
+// data: URI) extension is only a fallback hint. Returns null when the
+// type is none of png/jpeg/gif/webp.
+export function detectImageMediaType(bytes, urlHint) {
+  if (bytes && bytes.length >= 4) {
+    if (
+      bytes[0] === 0x89 && bytes[1] === 0x50 &&
+      bytes[2] === 0x4e && bytes[3] === 0x47
+    ) {
+      return "image/png";
+    }
+    if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+      return "image/jpeg";
+    }
+    if (
+      bytes[0] === 0x47 && bytes[1] === 0x49 &&
+      bytes[2] === 0x46 && bytes[3] === 0x38
+    ) {
+      return "image/gif";
+    }
+    if (
+      bytes.length >= 12 &&
+      bytes[0] === 0x52 && bytes[1] === 0x49 &&
+      bytes[2] === 0x46 && bytes[3] === 0x46 &&
+      bytes[8] === 0x57 && bytes[9] === 0x45 &&
+      bytes[10] === 0x42 && bytes[11] === 0x50
+    ) {
+      return "image/webp";
+    }
+  }
+  if (typeof urlHint === "string" && urlHint) {
+    const dataMatch = /^data:(image\/(?:png|jpeg|gif|webp));/.exec(urlHint);
+    if (dataMatch) return dataMatch[1];
+    const clean = urlHint.split(/[?#]/)[0].toLowerCase();
+    if (clean.endsWith(".png")) return "image/png";
+    if (clean.endsWith(".jpg") || clean.endsWith(".jpeg")) return "image/jpeg";
+    if (clean.endsWith(".gif")) return "image/gif";
+    if (clean.endsWith(".webp")) return "image/webp";
+  }
+  return null;
+}
+
+// PATCH the bot's own user object with a data-URI avatar. The fetch
+// implementation is a parameter so tests can inject a fake (the
+// Miniflare suite instead intercepts the real outbound fetch).
+export async function patchBotAvatar(fetchImpl, token, mediaType, base64Data) {
+  const res = await fetchImpl(`${DISCORD_API_BASE}/users/@me`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bot ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      avatar: `data:${mediaType};base64,${base64Data}`,
+    }),
+    redirect: "manual",
+  });
+  const text = await res.text();
+  let user = null;
+  try {
+    user = JSON.parse(text);
+  } catch (_) {
+    /* non-JSON body: user stays null, bodyText carries the detail */
+  }
+  return { status: res.status, user, bodyText: text };
+}
+
+async function handleAvatar(env, request) {
+  if (!isAdminKey(env, request)) {
+    return jsonResponse({ error: "unauthorized" }, 401);
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch (_) {
+    return jsonResponse({ error: "invalid JSON body" }, 400);
+  }
+  if (!env.DISCORD_BOT_TOKEN) {
+    return jsonResponse({ error: "discord bot not configured" }, 500);
+  }
+  let bytes = null;
+  let base64Data = null;
+  let urlHint = null;
+  if (typeof body?.image_url === "string" && body.image_url) {
+    urlHint = body.image_url;
+    let res;
+    try {
+      res = await fetch(urlHint, { redirect: "follow" });
+    } catch (e) {
+      return jsonResponse(
+        { error: "image fetch failed", detail: String(e).slice(0, 120) },
+        502
+      );
+    }
+    if (!res.ok) {
+      return jsonResponse(
+        { error: `image fetch failed: HTTP ${res.status}` },
+        502
+      );
+    }
+    const declared = Number(res.headers.get("Content-Length") || "");
+    if (Number.isFinite(declared) && declared > MAX_AVATAR_BYTES) {
+      return jsonResponse({ error: "image too large" }, 413);
+    }
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > MAX_AVATAR_BYTES) {
+      return jsonResponse({ error: "image too large" }, 413);
+    }
+    bytes = new Uint8Array(buf);
+    base64Data = b64encode(bytes);
+  } else if (typeof body?.image_base64 === "string" && body.image_base64) {
+    let raw = body.image_base64.trim();
+    // Tolerate a full data: URI: keep its media type as the hint.
+    const dataUri = /^data:(image\/[a-z0-9.+-]+);base64,(.*)$/is.exec(raw);
+    if (dataUri) {
+      urlHint = `data:${dataUri[1]};base64,`;
+      raw = dataUri[2];
+    }
+    base64Data = raw.replace(/\s+/g, "");
+    if (
+      !/^[A-Za-z0-9+/]+={0,2}$/.test(base64Data) ||
+      base64Data.length % 4 !== 0
+    ) {
+      return jsonResponse({ error: "image_base64 is not valid base64" }, 400);
+    }
+    if (base64Data.length > Math.ceil(MAX_AVATAR_BYTES / 3) * 4 + 4) {
+      return jsonResponse({ error: "image too large" }, 413);
+    }
+    try {
+      bytes = b64decode(base64Data);
+    } catch (_) {
+      return jsonResponse({ error: "image_base64 is not valid base64" }, 400);
+    }
+    if (bytes.length > MAX_AVATAR_BYTES) {
+      return jsonResponse({ error: "image too large" }, 413);
+    }
+  } else {
+    return jsonResponse(
+      { error: "image_base64 or image_url is required" },
+      400
+    );
+  }
+  const mediaType = detectImageMediaType(bytes, urlHint);
+  if (!mediaType) {
+    return jsonResponse(
+      { error: "unsupported image type (png/jpeg/gif/webp only)" },
+      400
+    );
+  }
+  const result = await patchBotAvatar(
+    fetch,
+    env.DISCORD_BOT_TOKEN,
+    mediaType,
+    base64Data
+  );
+  if (result.status !== 200) {
+    return jsonResponse(
+      {
+        error: "discord avatar update failed",
+        status: result.status,
+        body: result.bodyText.slice(0, 500),
+      },
+      result.status >= 400 && result.status < 600 ? result.status : 502
+    );
+  }
+  return jsonResponse(
+    {
+      status: 200,
+      id: typeof result.user?.id === "string" ? result.user.id : null,
+      username:
+        typeof result.user?.username === "string" ? result.user.username : null,
+      avatar:
+        typeof result.user?.avatar === "string" ? result.user.avatar : null,
+    },
+    200
+  );
+}
+
 // ---------- Worker front-end ----------
 
 function gatewayStub(env) {
@@ -1324,6 +1526,9 @@ export default {
       }
       if (url.pathname === "/send" && request.method === "POST") {
         return handleSend(env, request);
+      }
+      if (url.pathname === "/avatar" && request.method === "POST") {
+        return handleAvatar(env, request);
       }
       return jsonResponse({ error: "not found" }, 404);
     } catch (e) {

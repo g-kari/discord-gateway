@@ -392,10 +392,36 @@ test("pure: eventSilenceDecision reconnects only a ready, long-silent socket", (
 let mf;
 let discordSends = [];
 let lastDiscordSend = null;
+let avatarPatch = null;
 const RATE_LIMIT_CHANNEL = "999888777666555444";
 let rateLimitHits = 0;
+// 1x1 transparent PNG, used by the /avatar tests.
+const PNG_1PX_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAwMCAO+ip1sAAAAASUVORK5CYII=";
+const AVATAR_HASH = "a_0123456789abcdef0123456789abcdef";
 
 async function outboundService(req) {
+  if (
+    req.url === "https://discord.com/api/v10/users/@me" &&
+    req.method === "PATCH"
+  ) {
+    const body = await req.json();
+    avatarPatch = {
+      url: req.url,
+      authorization: req.headers.get("Authorization"),
+      body,
+    };
+    return Response.json(
+      { id: BOT_ID, username: "gateway-bot", avatar: AVATAR_HASH },
+      { status: 200 }
+    );
+  }
+  if (req.url === "https://images.example/avatar.png") {
+    return new Response(Buffer.from(PNG_1PX_B64, "base64"), {
+      status: 200,
+      headers: { "Content-Type": "image/png" },
+    });
+  }
   if (req.url.startsWith("https://discord.com/api/v10/channels/")) {
     const body = await req.json();
     const record = {
@@ -534,5 +560,152 @@ test("http: /send validates channel_id and content", async () => {
   assert.equal(
     (await send({ channel_id: "222333444555666777", content: "  " }, ADMIN_KEY)).status,
     400
+  );
+});
+
+// ---------- avatar helpers (pure) ----------
+
+test("pure: detectImageMediaType sniffs magic bytes, URL only as fallback", () => {
+  assert.equal(
+    pure.detectImageMediaType(
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      null
+    ),
+    "image/png"
+  );
+  assert.equal(
+    pure.detectImageMediaType(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]), null),
+    "image/jpeg"
+  );
+  assert.equal(
+    pure.detectImageMediaType(
+      new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]),
+      null
+    ),
+    "image/gif"
+  );
+  assert.equal(
+    pure.detectImageMediaType(
+      new Uint8Array([
+        0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50,
+      ]),
+      null
+    ),
+    "image/webp"
+  );
+  // Unknown bytes fall back to the URL extension; no hint means null.
+  assert.equal(
+    pure.detectImageMediaType(new Uint8Array([0, 1, 2, 3]), "https://x/y.JPG"),
+    "image/jpeg"
+  );
+  assert.equal(pure.detectImageMediaType(new Uint8Array([0, 1, 2, 3]), null), null);
+});
+
+test("pure: patchBotAvatar PATCHes @me with a data-URI avatar", async () => {
+  let seen = null;
+  const fakeFetch = async (url, init) => {
+    seen = { url, init };
+    return new Response(
+      JSON.stringify({ id: "1", username: "bot", avatar: "hash-1" }),
+      { status: 200 }
+    );
+  };
+  const r = await pure.patchBotAvatar(fakeFetch, "tok", "image/png", "QUJD");
+  assert.equal(r.status, 200);
+  assert.equal(r.user.avatar, "hash-1");
+  assert.equal(seen.url, "https://discord.com/api/v10/users/@me");
+  assert.equal(seen.init.method, "PATCH");
+  assert.equal(seen.init.headers.Authorization, "Bot tok");
+  assert.equal(
+    JSON.parse(seen.init.body).avatar,
+    "data:image/png;base64,QUJD"
+  );
+});
+
+// ---------- /connect diagnostics and /avatar (Miniflare) ----------
+
+test("http: /connect with the admin key returns diagnostics including lastError", async () => {
+  const res = await mf.dispatchFetch(ORIGIN + "/connect", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + ADMIN_KEY },
+  });
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(typeof j.connected, "boolean");
+  assert.equal(typeof j.ready, "boolean");
+  assert.ok("lastError" in j);
+  assert.ok(j.lastError === null || typeof j.lastError === "string");
+  assert.equal(typeof j.hasSession, "boolean");
+  assert.ok(j.lastDispatchAt === null || typeof j.lastDispatchAt === "number");
+  // The public /status still exposes exactly the two keys afterwards.
+  const pubRes = await mf.dispatchFetch(ORIGIN + "/status");
+  const pub = await pubRes.json();
+  assert.deepEqual(Object.keys(pub).sort(), ["connected", "ready"]);
+});
+
+async function avatar(bodyObj, key) {
+  const headers = { "Content-Type": "application/json" };
+  if (key) headers.Authorization = "Bearer " + key;
+  const res = await mf.dispatchFetch(ORIGIN + "/avatar", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(bodyObj),
+  });
+  const text = await res.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    /* keep null */
+  }
+  return { status: res.status, json };
+}
+
+test("http: /avatar rejects a missing admin key with 401", async () => {
+  const r = await avatar({ image_base64: PNG_1PX_B64 }, null);
+  assert.equal(r.status, 401);
+});
+
+test("http: /avatar rejects a bad body with 400", async () => {
+  assert.equal((await avatar({}, ADMIN_KEY)).status, 400);
+  assert.equal(
+    (await avatar({ image_base64: "!!! not base64 !!!" }, ADMIN_KEY)).status,
+    400
+  );
+  // Valid base64 but not a supported image type.
+  assert.equal(
+    (await avatar({ image_base64: "aGVsbG8gd29ybGQ=" }, ADMIN_KEY)).status,
+    400
+  );
+});
+
+test("http: /avatar sets the avatar from base64 and returns the avatar hash", async () => {
+  avatarPatch = null;
+  const r = await avatar({ image_base64: PNG_1PX_B64 }, ADMIN_KEY);
+  assert.equal(r.status, 200);
+  assert.equal(r.json.status, 200);
+  assert.equal(r.json.id, BOT_ID);
+  assert.equal(r.json.username, "gateway-bot");
+  assert.equal(r.json.avatar, AVATAR_HASH);
+  assert.ok(avatarPatch);
+  assert.equal(avatarPatch.authorization, "Bot " + BOT_TOKEN);
+  assert.equal(
+    avatarPatch.body.avatar,
+    "data:image/png;base64," + PNG_1PX_B64
+  );
+});
+
+test("http: /avatar fetches image_url and sets the avatar", async () => {
+  avatarPatch = null;
+  const r = await avatar(
+    { image_url: "https://images.example/avatar.png" },
+    ADMIN_KEY
+  );
+  assert.equal(r.status, 200);
+  assert.equal(r.json.avatar, AVATAR_HASH);
+  assert.ok(avatarPatch);
+  assert.equal(
+    avatarPatch.body.avatar,
+    "data:image/png;base64," + PNG_1PX_B64
   );
 });

@@ -1,0 +1,42 @@
+PASS auth null
+PASS auth invalid
+PASS auth no-expiry
+PASS auth nan-expiry
+PASS auth expired
+PASS auth no-user
+PASS auth props-spoof
+PASS auth no-client
+PASS auth scope-string
+PASS auth no-scope
+PASS auth write
+PASS auth outsider
+PASS auth audience
+PASS auth throws
+PASS origin http://reply.test
+PASS origin https://reply.test:444
+PASS origin https://reply.test/
+PASS origin https://other.test
+PASS origin null
+PASS origin https://reply.test.evil.test
+PASS origin http://localhost
+PASS host/resource https://reply.test/mcp
+PASS host/resource https://evil.test/mcp
+PASS host/resource http://reply.test/mcp
+PASS owner discovery no-origin
+PASS owner discovery https://reply.test
+PASS read scope cannot send
+PASS unknown response reserves once
+PASS unknown altered content/target conflicts
+PASS numeric receipt rejected
+PASS SQLite concurrent reservation sends once
+PASS SQLite full restart keeps unknown/sent dedup
+INDEPENDENT_AUDIT_PASS checks=32
+✔ test/independent-audit.integration.mjs (1666.260147ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 1
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1674.540867

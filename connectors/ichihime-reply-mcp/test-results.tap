@@ -1,0 +1,47 @@
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+
+> ichihime-discord-reply-connector@0.1.0 test
+> node --test test/*.test.mjs
+
+✔ auth uses exact trusted owner and scope (1.420513ms)
+✔ strict server-side allowlist and exact channel input (1.149555ms)
+✔ rejects DM (0.195477ms)
+✔ rejects thread (0.098284ms)
+✔ rejects query (0.086276ms)
+✔ rejects fragment (0.087118ms)
+✔ rejects credential (0.130952ms)
+✔ rejects trailing (0.112435ms)
+✔ rejects lookalike (0.113096ms)
+✔ rejects http (0.263476ms)
+✔ rejects encode (0.127948ms)
+✔ rejects other guild or channel (0.312308ms)
+✔ cannot inject bot, sender, destination, authorization, URL or key (0.94132ms)
+✔ one bounded message, no mentions or control bytes (0.447155ms)
+✔ dedup key remains same across destination/content changes, digest changes (18.62622ms)
+✔ upstream URL/path, bot, body and secret are server controlled (3.317875ms)
+✔ preflight fail-closed without send enablement, secret, or binding (0.488586ms)
+✔ successful receipt persisted, retries and receipt queries never re-send (6.330732ms)
+✔ changed content or allowed destination cannot bypass same-source dedup (3.006037ms)
+✔ concurrent identical requests reserve once (5.989312ms)
+✔ network persists unknown and never auto-retries (2.074312ms)
+✔ 429 persists unknown and never auto-retries (1.495743ms)
+✔ 500 persists unknown and never auto-retries (2.147039ms)
+✔ redirect persists unknown and never auto-retries (1.871905ms)
+✔ malformed persists unknown and never auto-retries (1.23432ms)
+✔ wrong channel persists unknown and never auto-retries (2.930146ms)
+✔ numeric id persists unknown and never auto-retries (1.579536ms)
+✔ wrong bot persists unknown and never auto-retries (1.533283ms)
+✔ oversized persists unknown and never auto-retries (1.363544ms)
+✔ crash after durable reservation refuses retry across instance restart (19.455755ms)
+✔ failure to reserve does not send (1.334211ms)
+✔ failure to persist successful receipt still blocks retry (1.714965ms)
+✔ read scope cannot send; outsider and disabled target cannot send (1.595709ms)
+✔ unknown receipt is read-only (1.03705ms)
+ℹ tests 34
+ℹ suites 0
+ℹ pass 34
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 172.410711

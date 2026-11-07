@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "ichihime-discord-owner-reply",
+  "version": "0.1.0",
+  "description": "Owner-only bounded Discord replies as ichihime through an authenticated MCP service.",
+  "author": { "name": "風見一姫" },
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "一姫 Discord返信",
+        "shortDescription": "本人専用の認証付き返信",
+        "longDescription": "本人認証と限定した送り先、固定Bot、永続重複排除を備える返信用接続。",
+        "developerName": "風見一姫",
+        "category": "Productivity",
+        "capabilities": ["Interactive"],
+        "defaultPrompt": "許可したDiscordチャンネルへ一姫として返信して。"
+      }
+    }
+  }
+}

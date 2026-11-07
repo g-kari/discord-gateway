@@ -18,7 +18,13 @@ new_sqlite_classes = ["Gateway"]
 #   DISCORD_BOT_TOKEN   Discord bot token (Bot authorization)
 #   CLAUDE_HOOK_SECRET  whsec_ HMAC secret shared with dots-events'
 #                       POST /claude-hook receiver
+#                       (FORWARD_MODE=claude-hook, the default)
+#   EVENTS_TRIGGER_KEY  Bearer key for dots-events' POST /trigger
+#                       (FORWARD_MODE=trigger; second-bot deployments)
 #   ADMIN_KEY           admin key for POST /connect and POST /send
+#
+# Vars:
+#   FORWARD_MODE        "claude-hook" (default) or "trigger"
 #
 # Endpoints (once routed/deployed):
 #   GET  /status   public: {"connected": bool, "ready": bool} only

@@ -3,7 +3,7 @@
 ユーザーの Agent メッシュ（クロワッサンド／dots など）向けの共有フロントエンド。Cloudflare Worker + Durable Object として実装し、Discord Bot として常時 Gateway に接続して、Bot 宛の発言を dots-events 経由でクロワッサンドへの依頼に変換する。このリポジトリの自動テストはローカル代替サービスまでを対象とし、実Discordと本番環境での疎通は別途確認が必要。
 
 - 実装: [worker.js](./worker.js)（単一ファイル、ランタイム依存なし。自動テストのみ `test/` 配下で Miniflare を devDependency として使用）
-- 受け渡し先: dots-events の `POST https://dots-events.0g0.xyz/claude-hook`（Standard Webhooks 署名つき。受信側は `request_id` で重複排除する）
+- 受け渡し先: 既定では dots-events の `POST https://dots-events.0g0.xyz/claude-hook`（Standard Webhooks 署名つき。受信側は `request_id` で重複排除する）。環境変数 `FORWARD_MODE=trigger` のデプロイでは `POST https://dots-events.0g0.xyz/trigger`（Bearer 認証、署名なし）に切り替わる（後述「2台目のBot」参照）
 
 ## 構成
 
@@ -18,8 +18,8 @@
 
 - 対象: **DM**、または **Bot がメンションされたギルドメッセージ**。Bot 自身と他の Bot の発言は無視する。
 - 転送 body: `{"text", "topic": "discord", "request_id": "discord-<message id>"}`。`text` の1行目は `[discord channel:<channel_id> guild:<guild_id or -> author:<username>]` で、本文から Bot メンションを取り除く。コードのインデントなど本文内の空白は保持する。返信先チャンネルはこの行で分かる。
-- 署名: Standard Webhooks（`webhook-id` / `webhook-timestamp` / `webhook-signature`、HMAC-SHA256）。dots-kick-events の実装と同一形式。
-- 転送はまずoutboxに永続化し、alarmからロック外のバックグラウンド配送を開始する。転送先の応答待ち中もACK・heartbeat・status処理を続け、1試行のタイムアウトは10秒。失敗はoutboxに残し、最大5回まで再試行する（受信側が `request_id` で重複排除するので再送は安全）。受信側が 429 を返したら `Retry-After` を尊重する。
+- 署名: Standard Webhooks（`webhook-id` / `webhook-timestamp` / `webhook-signature`、HMAC-SHA256）。dots-kick-events の実装と同一形式。`FORWARD_MODE=trigger` の場合は署名せず、`Authorization: Bearer <EVENTS_TRIGGER_KEY>` で `/trigger` に送る。
+- 転送はまずoutboxに永続化し、alarmからロック外のバックグラウンド配送を開始する。転送先の応答待ち中もACK・heartbeat・status処理を続け、1試行のタイムアウトは10秒。失敗はoutboxに残し、最大5回まで再試行する（受信側が `request_id` で重複排除するので再送は安全）。受信側が 429 を返したら `Retry-After` を尊重する。例外として trigger モードでは、429 以外の 4xx は「依頼自体が拒否された」として再試行せず、その時点で失敗として `forward_log` に記録する（再生で再送されてきても再投入しない）。
 - 転送済みの `request_id` は `forward_log` に1週間保持し、Resume 再生で同じメッセージが再送されてきたらローカルで弾く（受信側の重複排除と二重化）。
 
 ### 出口（Agent → Discord）
@@ -42,8 +42,24 @@
 | 名前 | 種別 | 用途 |
 |---|---|---|
 | `DISCORD_BOT_TOKEN` | シークレット（要設定） | Discord Bot トークン。Gateway の Identify と REST 呼び出しに使う |
-| `CLAUDE_HOOK_SECRET` | シークレット（要設定） | dots-events の `/claude-hook` と共有する `whsec_` HMAC 秘密 |
+| `FORWARD_MODE` | 変数（任意） | 転送モード。`claude-hook`（既定）または `trigger` |
+| `CLAUDE_HOOK_SECRET` | シークレット（`FORWARD_MODE=claude-hook` のとき要設定） | dots-events の `/claude-hook` と共有する `whsec_` HMAC 秘密 |
+| `EVENTS_TRIGGER_KEY` | シークレット（`FORWARD_MODE=trigger` のとき要設定） | dots-events の `/trigger` 用 Bearer キー |
 | `ADMIN_KEY` | シークレット（要設定） | `POST /connect` と `POST /send` の管理キー |
+
+## 2台目のBot（dots用デプロイ）
+
+同じ Worker を別デプロイすることで、dots（一姫）の Discord Bot の耳・口にもなれる。dots 側の Bot へのメンション／DM は、クロワッサンド宛の `/claude-hook` ではなく、dots-events の `/trigger` 経由で「dots への依頼」として投入する（`/claude-hook` とその秘密はクロワッサンド側専用なので、2台目には持たせない）。
+
+2台目のデプロイ設定:
+
+- `DISCORD_BOT_TOKEN`: dots の Bot のトークン
+- `FORWARD_MODE=trigger`
+- `EVENTS_TRIGGER_KEY`: dots-events の `/trigger` 用キー
+- `ADMIN_KEY`: そのデプロイ専用の管理キー
+- `CLAUDE_HOOK_SECRET` は設定しない（未設定でも trigger モードでは構成済みと判定される）
+
+転送 body は1台目と同一（`{"text", "topic": "discord", "request_id": "discord-<message id>"}`）。返信は1台目と同様に、そのデプロイの `POST /send`（管理キー認証）から dots の Bot として投稿する。
 
 ## デプロイ手順（参照）
 
@@ -56,6 +72,8 @@ npx --yes wrangler@4.149.0 secret put CLAUDE_HOOK_SECRET
 npx --yes wrangler@4.149.0 secret put ADMIN_KEY
 npx --yes wrangler@4.149.0 deploy
 ```
+
+（2台目の trigger モードでは `CLAUDE_HOOK_SECRET` の代わりに `EVENTS_TRIGGER_KEY` を設定し、`FORWARD_MODE=trigger` を変数として与える。）
 
 デプロイ後、`POST /connect`（管理キー）で初回接続を促し、`GET /status` が `{"connected": true, "ready": true}` になることを確認する。現状 `wrangler.toml` にルートはなく、`workers_dev = false` にしてある（公開経路は別途決める）。
 
@@ -74,7 +92,7 @@ npm install
 npm test
 ```
 
-Miniflareと純関数の単体テスト（`test/gateway.test.mjs`）に加え、`test/lifecycle.test.mjs`では固定依存版workerd内のローカルDiscord代替と実際のWebSocketを使い、Hello→Identify→READY、Resume、fatal停止、遅いWebhook配送中のheartbeat/ACK/statusと重複排除を検証する。署名形式が dots-kick-events と一致すること、MESSAGE_CREATE のフィルタ（自他の Bot を無視／DM を転送／メンションを転送／通常発言を無視）、Gateway プロトコルの判断（Hello→Identify／Resume、READY のセッション保存、Invalid Session の可否、ハートビート ACK 欠落時の再接続、fatal close code でのセッション破棄、4014 の案内文、DISPATCH 無音時の再接続判断）、`/send` の認証拒否・2000文字超の分割送信・429 リトライ、2000文字分割と `retry_after` 解釈の純関数、`/status` の形を検証する。
+Miniflareと純関数の単体テスト（`test/gateway.test.mjs`）に加え、`test/lifecycle.test.mjs`では固定依存版workerd内のローカルDiscord代替と実際のWebSocketを使い、Hello→Identify→READY、Resume、fatal停止、遅いWebhook配送中のheartbeat/ACK/statusと重複排除を検証する。`test/forward-mode.test.mjs`では `FORWARD_MODE` の振り分け（既定=署名つき `/claude-hook`、trigger=Bearer で `/trigger`・署名ヘッダなし）と、trigger モードの再試行分類（429以外の4xxは終了、5xxは再試行）を検証する。署名形式が dots-kick-events と一致すること、MESSAGE_CREATE のフィルタ（自他の Bot を無視／DM を転送／メンションを転送／通常発言を無視）、Gateway プロトコルの判断（Hello→Identify／Resume、READY のセッション保存、Invalid Session の可否、ハートビート ACK 欠落時の再接続、fatal close code でのセッション破棄、4014 の案内文、DISPATCH 無音時の再接続判断）、`/send` の認証拒否・2000文字超の分割送信・429 リトライ、2000文字分割と `retry_after` 解釈の純関数、`/status` の形を検証する。
 
 **未カバー**: 実Discord Gatewayへの接続、実トークン・権限・ネットワーク・本番配送。ローカル代替とのソケット接続はテストするが、実サービスでの疎通は別途確認が必要。テストは実Discordや本番Webhookへ接続しない。
 

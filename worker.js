@@ -7,16 +7,24 @@
 // charges. SQLite state survives restarts and alarms reconnect/resume.
 //
 // Inbound: MESSAGE_CREATE events that are DMs to the bot, or that mention
-// the bot in a guild channel, are forwarded to the dots-events server as
-// requests for Muse:
-//   POST https://dots-events.0g0.xyz/claude-hook
-// signed with Standard Webhooks (HMAC-SHA256, whsec_ secret — the same
-// scheme dots-kick-events implements for its own /claude-hook intake,
-// so signatures are byte-for-byte compatible). The body is
+// the bot in a guild channel, are forwarded to the dots-events server.
+// The body is
 //   {"text": ..., "topic": "discord", "request_id": "discord-<message id>"}
 // and the receiver deduplicates by request_id, so redelivery (Discord
 // replays dispatches after a resume) is safe. Failed forwards are kept
 // in a small SQLite outbox and retried from the alarm.
+//
+// The forward target depends on env FORWARD_MODE:
+//   "claude-hook" (default): POST https://dots-events.0g0.xyz/claude-hook
+//     signed with Standard Webhooks (HMAC-SHA256, whsec_ secret — the
+//     same scheme dots-kick-events implements for its own /claude-hook
+//     intake, so signatures are byte-for-byte compatible). Filed as a
+//     request for Muse.
+//   "trigger": POST https://dots-events.0g0.xyz/trigger with
+//     Authorization: Bearer <EVENTS_TRIGGER_KEY>, no signing. Filed as a
+//     request for the hub's subscribers (dots). A second deployment of
+//     this same Worker (e.g. dots' own bot) uses this mode, since the
+//     /claude-hook intake and its secret belong to Muse's side only.
 //
 // Outbound: agents reply into Discord through POST /send on this Worker
 // (admin-key auth), which calls the Discord REST API with the bot token.
@@ -24,7 +32,11 @@
 // Bindings / secrets (names only; values are never committed):
 //   GATEWAY             — Durable Object namespace (class Gateway)
 //   DISCORD_BOT_TOKEN   — secret; Discord bot token
+//   FORWARD_MODE        — var; "claude-hook" (default) or "trigger"
 //   CLAUDE_HOOK_SECRET  — secret; whsec_ HMAC secret for /claude-hook
+//                         (FORWARD_MODE=claude-hook only)
+//   EVENTS_TRIGGER_KEY  — secret; Bearer key for dots-events /trigger
+//                         (FORWARD_MODE=trigger only)
 //   ADMIN_KEY           — secret; key for POST /connect, /send, /avatar
 //
 // HTTP routes:
@@ -40,10 +52,11 @@
 import { DurableObject } from "cloudflare:workers";
 
 const SERVICE_NAME = "discord-gateway";
-const SERVICE_VERSION = "0.3.1";
+const SERVICE_VERSION = "0.4.0";
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const DEFAULT_GATEWAY_URL = "wss://gateway.discord.gg";
 const CLAUDE_HOOK_URL = "https://dots-events.0g0.xyz/claude-hook";
+const EVENTS_TRIGGER_URL = "https://dots-events.0g0.xyz/trigger";
 const MAX_FORWARD_ATTEMPTS = 5;
 
 // Gateway intents: GUILDS (1<<0) | DIRECT_MESSAGES (1<<12) |
@@ -199,6 +212,134 @@ export function buildForwardRequest(message, botUserId) {
     `[discord channel:${message.channel_id} guild:${guild} author:${username}]\n` +
     content;
   return { text, topic: "discord", request_id: `discord-${message.id}` };
+}
+
+// ---------- forward delivery modes ----------
+// A deployment forwards in exactly one of two modes, chosen by the
+// FORWARD_MODE env var:
+//   "claude-hook" (default): signed Standard Webhooks POST to
+//     dots-events' /claude-hook — files a request for Muse. Needs
+//     CLAUDE_HOOK_SECRET.
+//   "trigger": unsigned POST to dots-events' /trigger with
+//     Authorization: Bearer <EVENTS_TRIGGER_KEY> — files a request for
+//     the hub's subscribers (dots). For second-bot deployments, which
+//     must not hold Muse's /claude-hook secret.
+// Anything other than the exact string "trigger" selects claude-hook,
+// so existing deployments keep their behavior when the var is unset.
+
+export function forwardMode(env) {
+  return env && env.FORWARD_MODE === "trigger" ? "trigger" : "claude-hook";
+}
+
+// Name of the env var holding the active mode's forward credential.
+export function forwardSecretName(env) {
+  return forwardMode(env) === "trigger"
+    ? "EVENTS_TRIGGER_KEY"
+    : "CLAUDE_HOOK_SECRET";
+}
+
+// The active mode's forward credential, or undefined when not set.
+export function forwardSecret(env) {
+  if (!env) return undefined;
+  return forwardMode(env) === "trigger"
+    ? env.EVENTS_TRIGGER_KEY
+    : env.CLAUDE_HOOK_SECRET;
+}
+
+// One forward delivery attempt for an outbox row. Pure apart from the
+// injected fetch implementation, so the mode dispatch and the retry
+// classification are unit-testable without a Durable Object. Returns:
+//   { delivered, final, error, retryAfterMs }
+// - delivered: the receiver accepted the request (HTTP 2xx).
+// - final: retrying the identical body can never succeed, so the
+//   caller drops the row now instead of at the attempt cap. Only
+//   trigger mode produces this (a non-429 4xx rejects the request
+//   itself); claude-hook mode retries every failure to the cap,
+//   exactly as before.
+// - retryAfterMs: the receiver's 429 delay hint, when one was given.
+export async function attemptForward({ env, fetchImpl, requestId, body }) {
+  if (forwardMode(env) === "trigger") {
+    try {
+      const res = await fetchImpl(EVENTS_TRIGGER_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${env.EVENTS_TRIGGER_KEY}`,
+        },
+        body,
+        redirect: "manual",
+        signal: AbortSignal.timeout(10000),
+      });
+      if (res.ok) {
+        await res.body?.cancel();
+        return { delivered: true, final: false, error: null, retryAfterMs: null };
+      }
+      const error = `trigger HTTP ${res.status} for ${requestId}`;
+      if (res.status === 429) {
+        let bodyJson = null;
+        try {
+          bodyJson = await res.json();
+        } catch (_) {
+          /* no JSON body; fall back to the headers */
+        }
+        const seconds = parseRetryAfterSeconds({
+          body: bodyJson,
+          headers: res.headers,
+        });
+        return {
+          delivered: false,
+          final: false,
+          error,
+          retryAfterMs: seconds !== null ? Math.ceil(seconds * 1000) : null,
+        };
+      }
+      await res.body?.cancel();
+      const final = res.status >= 400 && res.status < 500;
+      return { delivered: false, final, error, retryAfterMs: null };
+    } catch (_) {
+      return {
+        delivered: false,
+        final: false,
+        error: `trigger request failed for ${requestId}`,
+        retryAfterMs: null,
+      };
+    }
+  }
+  try {
+    const ts = String(Math.floor(Date.now() / 1000));
+    const signature = await signBody(env.CLAUDE_HOOK_SECRET, requestId, ts, body);
+    const res = await fetchImpl(CLAUDE_HOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "webhook-id": requestId,
+        "webhook-timestamp": ts,
+        "webhook-signature": signature,
+      },
+      body,
+      redirect: "manual",
+      signal: AbortSignal.timeout(10000),
+    });
+    const ok = res.ok;
+    let error = null;
+    let retryAfterMs = null;
+    if (!ok) {
+      error = `claude-hook HTTP ${res.status} for ${requestId}`;
+      if (res.status === 429) {
+        const seconds = parseRetryAfterSeconds({ headers: res.headers });
+        if (seconds !== null) retryAfterMs = Math.ceil(seconds * 1000);
+      }
+    }
+    await res.body?.cancel();
+    return { delivered: ok, final: false, error, retryAfterMs };
+  } catch (_) {
+    return {
+      delivered: false,
+      final: false,
+      error: `claude-hook request failed for ${requestId}`,
+      retryAfterMs: null,
+    };
+  }
 }
 
 // ---------- gateway protocol state machine (pure) ----------
@@ -634,7 +775,7 @@ export class Gateway extends DurableObject {
   }
 
   isConfigured() {
-    return Boolean(this.env.DISCORD_BOT_TOKEN && this.env.CLAUDE_HOOK_SECRET);
+    return Boolean(this.env.DISCORD_BOT_TOKEN && forwardSecret(this.env));
   }
 
   loadState() {
@@ -772,7 +913,7 @@ export class Gateway extends DurableObject {
     if (!state.configured) {
       state.connected = false;
       state.ready = false;
-      state.lastError = "missing DISCORD_BOT_TOKEN or CLAUDE_HOOK_SECRET";
+      state.lastError = `missing DISCORD_BOT_TOKEN or ${forwardSecretName(this.env)}`;
       this.saveState(state);
       return this.statusSnapshot();
     }
@@ -1091,9 +1232,9 @@ export class Gateway extends DurableObject {
     // The caller arms an immediate alarm after persisting this row.
   }
 
-  // POST due outbox rows to dots-events' /claude-hook with a fresh
-  // Standard Webhooks signature per attempt. The receiver deduplicates
-  // by the body's request_id, so retries never file a request twice.
+  // POST due outbox rows to dots-events, in the deployment's forward
+  // mode (see attemptForward). The receiver deduplicates by the body's
+  // request_id, so retries never file a request twice.
   async flushOutbox() {
     if (this._flushPromise) return this._flushPromise;
     this._flushPromise = this.deliverOutbox().finally(async () => {
@@ -1104,11 +1245,11 @@ export class Gateway extends DurableObject {
   }
 
   async deliverOutbox() {
-    const secret = this.env.CLAUDE_HOOK_SECRET;
+    const secret = forwardSecret(this.env);
     if (!secret) {
       await this.runLocked(() => {
         const state = this.loadState();
-        state.lastForwardError = "missing CLAUDE_HOOK_SECRET";
+        state.lastForwardError = `missing ${forwardSecretName(this.env)}`;
         state.nextOutboxAt = null;
         this.saveState(state);
       });
@@ -1120,47 +1261,35 @@ export class Gateway extends DurableObject {
     ).toArray());
     for (const row of rows) {
       const attempts = row.attempts + 1;
-      let ok = false;
       let delayMs = Math.min(60000, 1000 * 2 ** attempts);
-      let error = null;
-      try {
-        const ts = String(Math.floor(Date.now() / 1000));
-        const signature = await signBody(secret, row.request_id, ts, row.body);
-        const res = await fetch(CLAUDE_HOOK_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "webhook-id": row.request_id,
-            "webhook-timestamp": ts,
-            "webhook-signature": signature,
-          },
-          body: row.body,
-          redirect: "manual",
-          signal: AbortSignal.timeout(10000),
-        });
-        ok = res.ok;
-        if (!ok) {
-          error = `claude-hook HTTP ${res.status} for ${row.request_id}`;
-          if (res.status === 429) {
-            const seconds = parseRetryAfterSeconds({ headers: res.headers });
-            if (seconds !== null) delayMs = Math.max(delayMs, Math.ceil(seconds * 1000));
-          }
-        }
-        await res.body?.cancel();
-      } catch (_) {
-        error = `claude-hook request failed for ${row.request_id}`;
+      const result = await attemptForward({
+        env: this.env,
+        fetchImpl: fetch,
+        requestId: row.request_id,
+        body: row.body,
+      });
+      const ok = result.delivered;
+      const error = result.error;
+      if (result.retryAfterMs !== null && result.retryAfterMs !== undefined) {
+        delayMs = Math.max(delayMs, result.retryAfterMs);
       }
       await this.runLocked(async () => {
         // Reload after I/O so concurrent ACK/session changes are never overwritten.
         const state = this.loadState();
         state.lastForwardError = error;
-        if (ok || attempts >= MAX_FORWARD_ATTEMPTS) {
+        if (ok || result.final || attempts >= MAX_FORWARD_ATTEMPTS) {
           this.ctx.storage.sql.exec("DELETE FROM outbox WHERE request_id = ?", row.request_id);
-          if (ok) {
+          if (ok || result.final) {
+            // forward_log dedups replays for a week. A final trigger
+            // failure (non-429 4xx) is logged here as failed — the
+            // request can never be filed, so a replay must not file
+            // it again — and counted as dropped below.
             this.ctx.storage.sql.exec(
               "INSERT OR REPLACE INTO forward_log (request_id, completed_at) VALUES (?, ?)",
               row.request_id, Date.now()
             );
+          }
+          if (ok) {
             state.forwardedCount += 1;
             state.lastForwardAt = Date.now();
           } else state.droppedForwardCount += 1;

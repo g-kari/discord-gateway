@@ -10,8 +10,11 @@
 // Miniflare cannot stand in for Discord's gateway, so the op-code
 // handling is covered at the pure-function level instead (see
 // handleGatewayPayload / heartbeatDecision / reconnectDecisionForClose),
-// and socket acquisition at the helper level (openGatewaySocket with a
-// fake fetch: a Node-side outbound mock cannot mint a WebSocket).
+// and socket acquisition/attachment at the helper level
+// (openGatewaySocket / attachGatewaySocket with fakes: a Node-side
+// outbound mock cannot mint a WebSocket, and whether the live runtime
+// accepts hibernation registration for a client socket is only
+// observable in production).
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -650,6 +653,84 @@ test("pure: openGatewaySocket throws with the HTTP status when the upgrade fails
     () => pure.openGatewaySocket(fakeFetch, "wss://gateway.discord.gg/"),
     /gateway upgrade failed: HTTP 403/
   );
+});
+
+// ---------- gateway socket attachment (pure, fakes) ----------
+
+test("pure: attachGatewaySocket prefers hibernation registration", () => {
+  const accepted = [];
+  const ctx = {
+    acceptWebSocket: (ws, tags) => {
+      accepted.push([ws, tags]);
+    },
+  };
+  const listeners = {};
+  const ws = {
+    addEventListener: (type, fn) => {
+      listeners[type] = fn;
+    },
+  };
+  const mode = pure.attachGatewaySocket({
+    ctx,
+    ws,
+    handlers: { onMessage() {}, onClose() {}, onError() {} },
+  });
+  assert.equal(mode, "hibernation");
+  assert.equal(accepted.length, 1);
+  assert.equal(accepted[0][0], ws);
+  assert.deepEqual(accepted[0][1], ["discord"]);
+  // Hibernation mode attaches no inline listeners at all.
+  assert.deepEqual(Object.keys(listeners), []);
+});
+
+test("pure: attachGatewaySocket falls back to inline listeners when registration throws", () => {
+  const ctx = {
+    acceptWebSocket: () => {
+      throw new Error(
+        "Cannot call `acceptWebSocket()` on this WebSocket because its " +
+          "pair has already been accepted or used in a Response"
+      );
+    },
+  };
+  const listeners = { message: [], close: [], error: [] };
+  let acceptCalls = 0;
+  const ws = {
+    // A fetch-upgrade client socket may also refuse accept(); the
+    // helper must ignore that and still wire the listeners.
+    accept: () => {
+      acceptCalls++;
+      throw new Error("already accepted");
+    },
+    addEventListener: (type, fn) => {
+      listeners[type].push(fn);
+    },
+  };
+  const received = [];
+  const closed = [];
+  const errors = [];
+  const mode = pure.attachGatewaySocket({
+    ctx,
+    ws,
+    handlers: {
+      onMessage: (data) => received.push(data),
+      onClose: (code, reason, wasClean) => closed.push([code, reason, wasClean]),
+      onError: (e) => errors.push(e),
+    },
+  });
+  assert.equal(mode, "inline");
+  assert.equal(acceptCalls, 1);
+  assert.equal(listeners.message.length, 1);
+  assert.equal(listeners.close.length, 1);
+  assert.equal(listeners.error.length, 1);
+  // A dispatched message event reaches the handler with its payload.
+  for (const fn of listeners.message) fn({ data: '{"op":0,"t":"READY"}' });
+  assert.deepEqual(received, ['{"op":0,"t":"READY"}']);
+  for (const fn of listeners.close)
+    fn({ code: 1006, reason: "abnormal", wasClean: false });
+  assert.deepEqual(closed, [[1006, "abnormal", false]]);
+  const boom = new Error("boom");
+  for (const fn of listeners.error) fn(boom);
+  assert.deepEqual(errors, [boom]);
 });
 
 // ---------- /connect diagnostics and /avatar (Miniflare) ----------

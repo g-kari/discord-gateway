@@ -2,9 +2,14 @@
 //
 // A single Durable Object (class Gateway, SQLite-backed, one global
 // instance) keeps a persistent outbound WebSocket connection to the
-// Discord Gateway, using WebSocket hibernation: the socket is registered
-// with ctx.acceptWebSocket(), so the object can sleep between events and
-// still be woken by Discord traffic, heartbeats and reconnect alarms.
+// Discord Gateway. Attachment is dual-mode (attachGatewaySocket()):
+// the preferred mode registers the socket with ctx.acceptWebSocket()
+// (WebSocket hibernation), so the object can sleep between events and
+// still be woken by Discord traffic, heartbeats and reconnect alarms;
+// when the runtime refuses that registration — a client socket from a
+// fetch Upgrade arrives already accepted on its pair and cannot be
+// re-accepted — the socket is instead held in an instance field with
+// inline addEventListener handlers feeding the same event processing.
 // The outbound socket itself is opened with fetch() and an Upgrade
 // header (the Workers client pattern — there is no usable
 // new WebSocket(url) client constructor, and fetch() refuses wss:
@@ -44,7 +49,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 const SERVICE_NAME = "discord-gateway";
-const SERVICE_VERSION = "0.3.0";
+const SERVICE_VERSION = "0.3.1";
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const DEFAULT_GATEWAY_URL = "wss://gateway.discord.gg";
 const CLAUDE_HOOK_URL = "https://dots-events.0g0.xyz/claude-hook";
@@ -544,8 +549,8 @@ function withGatewayParams(rawUrl) {
 // so the scheme is normalized (wss: -> https:, ws: -> http:) — the
 // gateway endpoint is an HTTPS endpoint that upgrades. The fetch
 // implementation is a parameter so tests can inject fake upgrade
-// responses. The caller (inside the Durable Object) registers the
-// returned socket with ctx.acceptWebSocket() for hibernation.
+// responses. The caller (inside the Durable Object) attaches the
+// returned socket via attachGatewaySocket() below.
 export async function openGatewaySocket(fetchImpl, url) {
   const upgradeUrl = String(url)
     .replace(/^wss:/i, "https:")
@@ -562,6 +567,42 @@ export async function openGatewaySocket(fetchImpl, url) {
   return ws;
 }
 
+// Attach an opened gateway socket to the Durable Object and return
+// the attachment mode: "hibernation" or "inline".
+//
+// Preferred: ctx.acceptWebSocket() (WebSocket hibernation) — the
+// runtime then delivers message/close/error events through the DO's
+// webSocketMessage/webSocketClose/webSocketError callbacks and can
+// sleep the object between events. But a client socket obtained from
+// a fetch Upgrade is already accepted on its pair in the current
+// runtime, and re-registering it throws ("Cannot call
+// `acceptWebSocket()` on this WebSocket because its pair has already
+// been accepted or used in a Response" — observed live on v0.3.0).
+// In that case fall back to inline addEventListener handlers that
+// funnel into the exact same processing; the caller keeps the socket
+// in an instance field so the object can find and close it. ctx and
+// the handlers are parameters so tests can drive both modes with
+// fakes.
+export function attachGatewaySocket({ ctx, ws, handlers }) {
+  try {
+    ctx.acceptWebSocket(ws, ["discord"]);
+    return "hibernation";
+  } catch (_) {
+    /* registration refused (see above): attach inline instead */
+  }
+  try {
+    if (ws && typeof ws.accept === "function") ws.accept();
+  } catch (_) {
+    /* already accepted on its pair; the listeners below still work */
+  }
+  ws.addEventListener("message", (event) => handlers.onMessage(event.data));
+  ws.addEventListener("close", (event) =>
+    handlers.onClose(event.code, event.reason, event.wasClean)
+  );
+  ws.addEventListener("error", (event) => handlers.onError(event));
+  return "inline";
+}
+
 // Test-only access to the non-function values above (the Workers runtime
 // requires every named export of the main module to be a function or a
 // handler class, so constants/objects cannot be exported directly).
@@ -575,6 +616,15 @@ export class Gateway extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this._lock = Promise.resolve();
+    // The currently attached gateway socket and how it is attached
+    // ("hibernation" | "inline" | null). In hibernation mode the
+    // runtime also tracks the socket (ctx.getWebSockets); after a
+    // hibernation wake these fields reset and the runtime registry is
+    // the source of truth. In inline mode this field is the ONLY
+    // handle on the socket, so it is what getGatewaySocket() consults
+    // first and what the close/error handlers clear.
+    this._socket = null;
+    this._socketMode = null;
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     );
@@ -645,6 +695,10 @@ export class Gateway extends DurableObject {
   }
 
   getGatewaySocket() {
+    if (this._socket) {
+      const rs = this._socket.readyState;
+      if (rs === 0 || rs === 1) return this._socket; // CONNECTING or OPEN
+    }
     const sockets = this.ctx.getWebSockets("discord");
     for (let i = sockets.length - 1; i >= 0; i--) {
       const rs = sockets[i].readyState;
@@ -758,7 +812,18 @@ export class Gateway extends DurableObject {
       await this.scheduleAlarmLocked(state);
       return this.statusSnapshot();
     }
-    // Drop any stale (closed/closing) accepted sockets before dialing.
+    // Drop any stale (closed/closing) sockets before dialing: the
+    // inline-held one (if it is not the live socket found above) and
+    // any hibernation-registered ones.
+    if (this._socket) {
+      try {
+        this._socket.close(1000, "replaced");
+      } catch (_) {
+        /* already gone */
+      }
+      this._socket = null;
+      this._socketMode = null;
+    }
     for (const ws of this.ctx.getWebSockets("discord")) {
       try {
         ws.close(1000, "replaced");
@@ -771,7 +836,17 @@ export class Gateway extends DurableObject {
     const url = await this.gatewayUrlForConnect(state);
     try {
       const ws = await openGatewaySocket(fetch, url);
-      this.ctx.acceptWebSocket(ws, ["discord"]);
+      this._socketMode = attachGatewaySocket({
+        ctx: this.ctx,
+        ws,
+        handlers: {
+          onMessage: (data) => this.handleSocketMessage(ws, data),
+          onClose: (code, reason, wasClean) =>
+            this.handleSocketClose(ws, code, reason, wasClean),
+          onError: (error) => this.handleSocketError(ws, error),
+        },
+      });
+      this._socket = ws;
       state.connected = true;
       state.ready = false;
       state.helloReceived = false;
@@ -797,8 +872,17 @@ export class Gateway extends DurableObject {
   }
 
   // --- gateway event handling ---
+  //
+  // The runtime callbacks (hibernation mode) delegate to the internal
+  // handleSocket* methods; the inline listeners installed by
+  // attachGatewaySocket() call the same methods, so both attachment
+  // modes share one processing path.
 
   async webSocketMessage(ws, message) {
+    return this.handleSocketMessage(ws, message);
+  }
+
+  async handleSocketMessage(ws, message) {
     await this.runLocked(async () => {
       let payload;
       try {
@@ -869,6 +953,14 @@ export class Gateway extends DurableObject {
   }
 
   async webSocketClose(ws, code, reason, wasClean) {
+    return this.handleSocketClose(ws, code, reason, wasClean);
+  }
+
+  async handleSocketClose(ws, code, reason, wasClean) {
+    if (this._socket === ws) {
+      this._socket = null;
+      this._socketMode = null;
+    }
     await this.runLocked(async () => {
       const state = this.loadState();
       state.connected = false;
@@ -901,6 +993,14 @@ export class Gateway extends DurableObject {
   }
 
   async webSocketError(ws, error) {
+    return this.handleSocketError(ws, error);
+  }
+
+  async handleSocketError(ws, error) {
+    if (this._socket === ws) {
+      this._socket = null;
+      this._socketMode = null;
+    }
     await this.runLocked(async () => {
       const state = this.loadState();
       state.connected = false;

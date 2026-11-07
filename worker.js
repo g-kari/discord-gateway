@@ -1,58 +1,77 @@
 // discord-gateway — a shared Discord ear/mouth for the user's agent mesh.
 //
 // A single Durable Object (class Gateway, SQLite-backed, one global
-// instance) keeps a persistent outbound WebSocket connection to the
-// Discord Gateway, using fetch Upgrade and standard client WebSocket events.
-// Outgoing sockets cannot hibernate, so connected objects incur duration
-// charges. SQLite state survives restarts and alarms reconnect/resume.
+// instance) keeps persistent outbound WebSocket connections to the
+// Discord Gateway — ONE PER CONFIGURED BOT. Two bots share the Worker
+// and the object (the owner's cost decision: one resident object
+// instead of two deployments):
+//   "croissand" (primary): Muse's bot. Forwards go to dots-events'
+//     /claude-hook (signed), filed as requests for Muse.
+//   "ichihime": dots' bot. Forwards go to dots-events' /trigger
+//     (Bearer key), filed as requests for the hub's subscribers.
+// A bot whose secrets are not set is simply idle: it never connects
+// and never errors, while the other bot runs exactly as before.
+// Outgoing sockets cannot hibernate, so a connected object incurs
+// duration charges. SQLite state survives restarts and alarms
+// reconnect/resume each connection independently.
 //
-// Inbound: MESSAGE_CREATE events that are DMs to the bot, or that mention
-// the bot in a guild channel, are forwarded to the dots-events server.
+// Inbound: MESSAGE_CREATE events that are DMs to a bot, or that mention
+// that bot in a guild channel, are forwarded to the dots-events server.
 // The body is
 //   {"text": ..., "topic": "discord", "request_id": "discord-<message id>"}
 // and the receiver deduplicates by request_id, so redelivery (Discord
 // replays dispatches after a resume) is safe. Failed forwards are kept
-// in a small SQLite outbox and retried from the alarm.
-//
-// The forward target depends on env FORWARD_MODE:
-//   "claude-hook" (default): POST https://dots-events.0g0.xyz/claude-hook
-//     signed with Standard Webhooks (HMAC-SHA256, whsec_ secret — the
-//     same scheme dots-kick-events implements for its own /claude-hook
-//     intake, so signatures are byte-for-byte compatible). Filed as a
-//     request for Muse.
-//   "trigger": POST https://dots-events.0g0.xyz/trigger with
-//     Authorization: Bearer <EVENTS_TRIGGER_KEY>, no signing. Filed as a
-//     request for the hub's subscribers (dots). A second deployment of
-//     this same Worker (e.g. dots' own bot) uses this mode, since the
-//     /claude-hook intake and its secret belong to Muse's side only.
+// in a small SQLite outbox (one row per bot + request_id) and retried
+// from the alarm; each row is delivered in its own bot's forward mode
+// (see attemptForward):
+//   croissand → POST https://dots-events.0g0.xyz/claude-hook, signed
+//     with Standard Webhooks (HMAC-SHA256, whsec_ secret — the same
+//     scheme dots-kick-events implements for its own /claude-hook
+//     intake, so signatures are byte-for-byte compatible).
+//   ichihime → POST https://dots-events.0g0.xyz/trigger with
+//     Authorization: Bearer <EVENTS_TRIGGER_KEY>, no signing (the
+//     /claude-hook intake and its secret belong to Muse's side only).
 //
 // Outbound: agents reply into Discord through POST /send on this Worker
-// (admin-key auth), which calls the Discord REST API with the bot token.
+// (admin-key auth), which calls the Discord REST API with the selected
+// bot's token.
 //
 // Bindings / secrets (names only; values are never committed):
-//   GATEWAY             — Durable Object namespace (class Gateway)
-//   DISCORD_BOT_TOKEN   — secret; Discord bot token
-//   FORWARD_MODE        — var; "claude-hook" (default) or "trigger"
-//   CLAUDE_HOOK_SECRET  — secret; whsec_ HMAC secret for /claude-hook
-//                         (FORWARD_MODE=claude-hook only)
-//   EVENTS_TRIGGER_KEY  — secret; Bearer key for dots-events /trigger
-//                         (FORWARD_MODE=trigger only)
-//   ADMIN_KEY           — secret; key for POST /connect, /send, /avatar
+//   GATEWAY                  — Durable Object namespace (class Gateway)
+//   DISCORD_BOT_TOKEN        — secret; croissand's Discord bot token
+//   DISCORD_BOT_TOKEN_ICHICHIME — secret; ichihime's Discord bot token
+//   CLAUDE_HOOK_SECRET       — secret; whsec_ HMAC secret for
+//                              croissand's /claude-hook forwards
+//   EVENTS_TRIGGER_KEY       — secret; Bearer key for ichihime's
+//                              /trigger forwards
+//   ADMIN_KEY                — secret; key for POST /connect, /send,
+//                              /avatar
+//   FORWARD_MODE             — legacy var, only consulted by
+//                              attemptForward when no bot is given
+//                              (deployments no longer set it)
 //
 // HTTP routes:
 //   GET  /         service info (name / version)
-//   GET  /status   public; exactly {"connected": bool, "ready": bool}
+//   GET  /status   public; {"connected": bool, "ready": bool} for the
+//                  primary bot (legacy shape) plus "bots" detail:
+//                  {"bots": {"croissand": {"connected", "ready",
+//                  "configured"}, "ichihime": {...}}}
 //   POST /connect  admin key; nudge the Durable Object to (re)connect;
-//                  the response carries admin-only diagnostics
-//                  {connected, ready, lastError, hasSession, lastDispatchAt}
-//   POST /send     admin key; {"channel_id", "content"} -> Discord REST
-//   POST /avatar   admin key; {"image_base64"} or {"image_url"} ->
-//                  PATCH the bot's own avatar via Discord REST
+//                  optional JSON body {"bot": "ichihime"} targets one
+//                  bot (absent = all bots). The response carries
+//                  admin-only diagnostics for the primary bot
+//                  {connected, ready, lastError, hasSession,
+//                  lastDispatchAt} plus a per-bot "bots" map
+//   POST /send     admin key; {"channel_id", "content", "bot"?} ->
+//                  Discord REST, sent as the selected bot
+//                  ("croissand" by default)
+//   POST /avatar   admin key; {"image_base64" | "image_url", "bot"?} ->
+//                  PATCH the selected bot's avatar via Discord REST
 
 import { DurableObject } from "cloudflare:workers";
 
 const SERVICE_NAME = "discord-gateway";
-const SERVICE_VERSION = "0.4.0";
+const SERVICE_VERSION = "0.5.0";
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const DEFAULT_GATEWAY_URL = "wss://gateway.discord.gg";
 const CLAUDE_HOOK_URL = "https://dots-events.0g0.xyz/claude-hook";
@@ -66,6 +85,44 @@ const MAX_FORWARD_ATTEMPTS = 5;
 // runtime rejects non-function named exports in the main module. Tests
 // reach this and DEFAULT_GATEWAY_STATE through __testHooks() below.)
 const GATEWAY_INTENTS = 37377;
+
+// ---------- bot registry ----------
+// The bots hosted by this deployment, keyed by short name. Each bot
+// has its own token secret, its own forward mode + credential, and its
+// own gateway connection inside the one Durable Object. userId is the
+// bot's Discord user id (informational: the live identity is learned
+// from each connection's READY dispatch and kept in that bot's state).
+// "croissand" is the primary bot: the legacy single-bot surfaces
+// (GET /status top-level fields, POST /connect diagnostics, the /send
+// and /avatar defaults) all describe it.
+
+const BOT_CONFIGS = Object.freeze({
+  croissand: Object.freeze({
+    key: "croissand",
+    tokenEnv: "DISCORD_BOT_TOKEN",
+    forwardMode: "claude-hook",
+    forwardSecretEnv: "CLAUDE_HOOK_SECRET",
+    userId: "1568508479293890673",
+  }),
+  ichihime: Object.freeze({
+    key: "ichihime",
+    tokenEnv: "DISCORD_BOT_TOKEN_ICHICHIME",
+    forwardMode: "trigger",
+    forwardSecretEnv: "EVENTS_TRIGGER_KEY",
+    userId: "1568548424519913482",
+  }),
+});
+const BOT_KEYS = Object.freeze(Object.keys(BOT_CONFIGS));
+const PRIMARY_BOT = "croissand";
+
+// A bot is configured when both its token and its forward credential
+// are present in env. Unconfigured bots stay idle (no connection
+// attempts, no errors) while configured bots run normally.
+export function botConfigured(env, botKey) {
+  const config = BOT_CONFIGS[botKey];
+  if (!config || !env) return false;
+  return Boolean(env[config.tokenEnv] && env[config.forwardSecretEnv]);
+}
 
 // ---------- small helpers ----------
 
@@ -215,17 +272,20 @@ export function buildForwardRequest(message, botUserId) {
 }
 
 // ---------- forward delivery modes ----------
-// A deployment forwards in exactly one of two modes, chosen by the
-// FORWARD_MODE env var:
-//   "claude-hook" (default): signed Standard Webhooks POST to
-//     dots-events' /claude-hook — files a request for Muse. Needs
+// A forward goes in one of two modes:
+//   "claude-hook": signed Standard Webhooks POST to dots-events'
+//     /claude-hook — files a request for Muse. Needs
 //     CLAUDE_HOOK_SECRET.
 //   "trigger": unsigned POST to dots-events' /trigger with
 //     Authorization: Bearer <EVENTS_TRIGGER_KEY> — files a request for
-//     the hub's subscribers (dots). For second-bot deployments, which
-//     must not hold Muse's /claude-hook secret.
-// Anything other than the exact string "trigger" selects claude-hook,
-// so existing deployments keep their behavior when the var is unset.
+//     the hub's subscribers (dots). This mode exists so dots' side
+//     never holds Muse's /claude-hook secret.
+// Production delivery always names a bot, and the bot's static config
+// (BOT_CONFIGS) fixes its mode + credential: croissand → claude-hook,
+// ichihime → trigger. The FORWARD_MODE env var is a legacy fallback
+// consulted only when no bot is given (attemptForward's original
+// single-deployment contract, kept for its tests): anything other
+// than the exact string "trigger" selects claude-hook.
 
 export function forwardMode(env) {
   return env && env.FORWARD_MODE === "trigger" ? "trigger" : "claude-hook";
@@ -246,9 +306,25 @@ export function forwardSecret(env) {
     : env.CLAUDE_HOOK_SECRET;
 }
 
+// Resolve the effective { mode, secret } for one delivery: the bot's
+// static config when a bot is named, the legacy env fallback otherwise.
+function forwardTarget(env, bot) {
+  const config = bot ? BOT_CONFIGS[bot] : null;
+  if (config) {
+    return {
+      mode: config.forwardMode,
+      secret: env ? env[config.forwardSecretEnv] : undefined,
+    };
+  }
+  return { mode: forwardMode(env), secret: forwardSecret(env) };
+}
+
 // One forward delivery attempt for an outbox row. Pure apart from the
 // injected fetch implementation, so the mode dispatch and the retry
-// classification are unit-testable without a Durable Object. Returns:
+// classification are unit-testable without a Durable Object. `bot`
+// names the bot the row belongs to (its static config picks the mode
+// and credential); omit it for the legacy env-driven dispatch.
+// Returns:
 //   { delivered, final, error, retryAfterMs }
 // - delivered: the receiver accepted the request (HTTP 2xx).
 // - final: retrying the identical body can never succeed, so the
@@ -257,14 +333,15 @@ export function forwardSecret(env) {
 //   itself); claude-hook mode retries every failure to the cap,
 //   exactly as before.
 // - retryAfterMs: the receiver's 429 delay hint, when one was given.
-export async function attemptForward({ env, fetchImpl, requestId, body }) {
-  if (forwardMode(env) === "trigger") {
+export async function attemptForward({ env, bot, fetchImpl, requestId, body }) {
+  const { mode, secret } = forwardTarget(env, bot);
+  if (mode === "trigger") {
     try {
       const res = await fetchImpl(EVENTS_TRIGGER_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${env.EVENTS_TRIGGER_KEY}`,
+          Authorization: `Bearer ${secret}`,
         },
         body,
         redirect: "manual",
@@ -307,7 +384,7 @@ export async function attemptForward({ env, fetchImpl, requestId, body }) {
   }
   try {
     const ts = String(Math.floor(Date.now() / 1000));
-    const signature = await signBody(env.CLAUDE_HOOK_SECRET, requestId, ts, body);
+    const signature = await signBody(secret, requestId, ts, body);
     const res = await fetchImpl(CLAUDE_HOOK_URL, {
       method: "POST",
       headers: {
@@ -343,8 +420,9 @@ export async function attemptForward({ env, fetchImpl, requestId, body }) {
 }
 
 // ---------- gateway protocol state machine (pure) ----------
-// The Durable Object persists one state object. handleGatewayPayload()
-// maps (state, gateway payload) -> { state, actions } without touching
+// The Durable Object persists one state object PER BOT. The same pure
+// machine drives every bot's connection: handleGatewayPayload() maps
+// (state, gateway payload) -> { state, actions } without touching
 // storage or sockets, so the protocol decisions are unit-testable.
 // Actions: {type:"identify"} {type:"resume"} {type:"heartbeat"}
 //          {type:"close_socket", code} {type:"schedule_alarm"}
@@ -719,7 +797,7 @@ export function attachGatewaySocket({ ws, handlers }) {
 // requires every named export of the main module to be a function or a
 // handler class, so constants/objects cannot be exported directly).
 export function __testHooks() {
-  return { GATEWAY_INTENTS, DEFAULT_GATEWAY_STATE, MAX_EVENT_SILENCE_MS };
+  return { GATEWAY_INTENTS, DEFAULT_GATEWAY_STATE, MAX_EVENT_SILENCE_MS, BOT_CONFIGS, BOT_KEYS, PRIMARY_BOT };
 }
 
 // ---------- Durable Object: Gateway ----------
@@ -728,39 +806,88 @@ export class Gateway extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this._lock = Promise.resolve();
-    this._socket = null;
-    this._socketMode = null;
+    // Live gateway sockets, one per bot: botKey -> { ws, mode } | null.
+    this._sockets = {};
     this._flushPromise = null;
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     );
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS outbox (" +
-        "request_id TEXT PRIMARY KEY, body TEXT NOT NULL, " +
+        "bot TEXT NOT NULL DEFAULT 'croissand', " +
+        "request_id TEXT NOT NULL, body TEXT NOT NULL, " +
         "attempts INTEGER NOT NULL DEFAULT 0, " +
-        "next_attempt_at INTEGER NOT NULL, created_at INTEGER NOT NULL)"
+        "next_attempt_at INTEGER NOT NULL, created_at INTEGER NOT NULL, " +
+        "PRIMARY KEY (bot, request_id))"
     );
     // Completed forwards, kept for a week: after a gateway Resume,
     // Discord replays recent events, and Hermes dedups those replays
     // with a local cache for the same reason. The receiver dedups by
     // request_id too, so this table only saves redundant round trips.
+    // Keyed per bot: one Discord message can be delivered to BOTH bots
+    // (e.g. a message mentioning both), and each bot must forward its
+    // own copy to its own target.
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS forward_log (" +
-        "request_id TEXT PRIMARY KEY, completed_at INTEGER NOT NULL)"
+        "bot TEXT NOT NULL DEFAULT 'croissand', " +
+        "request_id TEXT NOT NULL, completed_at INTEGER NOT NULL, " +
+        "PRIMARY KEY (bot, request_id))"
     );
-    // Self-start: if configured and no alarm is pending, arrange a
-    // watchdog wake-up so a configured-but-disconnected object reconnects
-    // on its own (e.g. after a deploy or object restart with no alarm).
+    this.migrateStorage();
+    // Self-start: if any bot is configured and no alarm is pending,
+    // arrange a watchdog wake-up so a configured-but-disconnected
+    // object reconnects on its own (e.g. after a deploy or object
+    // restart with no alarm).
     try {
       this.ctx.blockConcurrencyWhile(async () => {
         const existing = await this.ctx.storage.getAlarm();
-        if (existing === null && this.isConfigured()) {
+        if (existing === null && this.anyBotConfigured()) {
           await this.ctx.storage.setAlarm(Date.now() + 60000);
         }
       });
     } catch (_) {
       /* best effort */
     }
+  }
+
+  // In-place storage upgrade for the two-bot layout. Tables created
+  // by the single-bot versions have no `bot` column and a bare
+  // request_id primary key; rebuild them with the bot dimension,
+  // attributing every existing row to croissand (the only bot that
+  // could have filed it). No Durable Object class changes and no
+  // wrangler migrations are involved — the class name stays Gateway.
+  // Safe to call repeatedly: it no-ops once the column exists.
+  migrateStorage() {
+    this.ensureBotDimension(
+      "outbox",
+      "(bot TEXT NOT NULL DEFAULT 'croissand', request_id TEXT NOT NULL, " +
+        "body TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, " +
+        "next_attempt_at INTEGER NOT NULL, created_at INTEGER NOT NULL, " +
+        "PRIMARY KEY (bot, request_id))",
+      ["request_id", "body", "attempts", "next_attempt_at", "created_at"]
+    );
+    this.ensureBotDimension(
+      "forward_log",
+      "(bot TEXT NOT NULL DEFAULT 'croissand', request_id TEXT NOT NULL, " +
+        "completed_at INTEGER NOT NULL, PRIMARY KEY (bot, request_id))",
+      ["request_id", "completed_at"]
+    );
+  }
+
+  ensureBotDimension(table, createBody, columns) {
+    const info = this.ctx.storage.sql
+      .exec(`PRAGMA table_info(${table})`)
+      .toArray();
+    if (!info.length || info.some((c) => c.name === "bot")) return;
+    const tmp = `${table}_v2`;
+    const cols = columns.join(", ");
+    this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${tmp}`);
+    this.ctx.storage.sql.exec(`CREATE TABLE ${tmp} ${createBody}`);
+    this.ctx.storage.sql.exec(
+      `INSERT INTO ${tmp} (bot, ${cols}) SELECT '${PRIMARY_BOT}', ${cols} FROM ${table}`
+    );
+    this.ctx.storage.sql.exec(`DROP TABLE ${table}`);
+    this.ctx.storage.sql.exec(`ALTER TABLE ${tmp} RENAME TO ${table}`);
   }
 
   // Serialize state mutations inside the object; gateway events, alarms
@@ -774,61 +901,107 @@ export class Gateway extends DurableObject {
     return run;
   }
 
-  isConfigured() {
-    return Boolean(this.env.DISCORD_BOT_TOKEN && forwardSecret(this.env));
+  isConfigured(botKey = PRIMARY_BOT) {
+    return botConfigured(this.env, botKey);
   }
 
-  loadState() {
+  anyBotConfigured() {
+    return BOT_KEYS.some((botKey) => this.isConfigured(botKey));
+  }
+
+  stateKey(botKey) {
+    return `gateway-state:${botKey}`;
+  }
+
+  readStateRow(key) {
     const rows = this.ctx.storage.sql
-      .exec("SELECT key, value FROM kv WHERE key = 'gateway-state'")
+      .exec("SELECT key, value FROM kv WHERE key = ?", key)
       .toArray();
-    if (!rows.length) return normalizeGatewayState(null);
+    if (!rows.length) return null;
     try {
       return normalizeGatewayState(JSON.parse(rows[0].value));
     } catch (_) {
-      return normalizeGatewayState(null);
+      return null;
     }
   }
 
-  saveState(state) {
+  // Per-bot state. The single-bot versions stored the one state under
+  // the kv key "gateway-state"; on first load for the primary bot,
+  // that legacy row is adopted as croissand's state (copied to the
+  // per-bot key, legacy key deleted) so the live session — session_id,
+  // seq, resume URL — survives the upgrade and can Resume.
+  loadState(botKey = PRIMARY_BOT) {
+    const own = this.readStateRow(this.stateKey(botKey));
+    if (own) return own;
+    if (botKey === PRIMARY_BOT) {
+      const legacy = this.readStateRow("gateway-state");
+      if (legacy) {
+        const migrated = this.saveState(legacy, botKey);
+        this.ctx.storage.sql.exec(
+          "DELETE FROM kv WHERE key = ?",
+          "gateway-state"
+        );
+        return migrated;
+      }
+    }
+    return normalizeGatewayState(null);
+  }
+
+  saveState(state, botKey = PRIMARY_BOT) {
     const normalized = normalizeGatewayState(state);
     this.ctx.storage.sql.exec(
-      "INSERT INTO kv (key, value) VALUES ('gateway-state', ?) " +
+      "INSERT INTO kv (key, value) VALUES (?, ?) " +
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      this.stateKey(botKey),
       JSON.stringify(normalized)
     );
     return normalized;
   }
 
-  getGatewaySocket() {
-    const ws = this._socket;
+  getGatewaySocket(botKey = PRIMARY_BOT) {
+    const entry = this._sockets[botKey];
+    const ws = entry?.ws;
     return ws && (ws.readyState === 0 || ws.readyState === 1) ? ws : null;
   }
 
-  closeGatewaySocket(ws, reason) {
-    if (this._socket === ws) {
-      this._socket = null;
-      this._socketMode = null;
+  // Which bot a socket belongs to (used by the runtime webSocket*
+  // callbacks, which do not carry bot context).
+  botKeyForSocket(ws) {
+    for (const botKey of BOT_KEYS) {
+      if (this._sockets[botKey]?.ws === ws) return botKey;
+    }
+    return null;
+  }
+
+  closeGatewaySocket(botKey, ws, reason) {
+    if (this._sockets[botKey]?.ws === ws) {
+      this._sockets[botKey] = null;
     }
     try { ws.close(4000, reason); } catch (_) { /* already closed */ }
   }
 
-  statusSnapshot() {
-    const state = this.loadState();
-    const socket = this.getGatewaySocket();
+  statusSnapshot(botKey = PRIMARY_BOT) {
+    const state = this.loadState(botKey);
+    const socket = this.getGatewaySocket(botKey);
     const connected = socket?.readyState === 1;
-    return { connected, ready: connected && state.ready };
+    return {
+      connected,
+      ready: connected && state.ready,
+      configured: this.isConfigured(botKey),
+    };
   }
 
   // Admin-only view: statusSnapshot() plus the recorded failure state,
   // so an operator holding the admin key can see WHY a connect attempt
   // is not landing (missing secrets, gateway lookup failure, close code
   // guidance, ...). Relayed only by the admin-gated POST /connect; the
-  // public GET /status keeps returning exactly {connected, ready}.
-  diagnosticsSnapshot() {
-    const state = this.loadState();
+  // public GET /status keeps the bot detail free of failure internals.
+  diagnosticsSnapshot(botKey = PRIMARY_BOT) {
+    const state = this.loadState(botKey);
+    const { connected, ready } = this.statusSnapshot(botKey);
     return {
-      ...this.statusSnapshot(),
+      connected,
+      ready,
       lastError: state.lastError ?? null,
       hasSession:
         typeof state.sessionId === "string" && state.sessionId !== null,
@@ -836,17 +1009,35 @@ export class Gateway extends DurableObject {
     };
   }
 
-  async scheduleAlarmLocked(state) {
+  // Aggregate diagnostics for POST /connect: the primary bot's fields
+  // at top level (the legacy shape) plus every bot under "bots".
+  diagnosticsResponse() {
+    const bots = {};
+    for (const botKey of BOT_KEYS) {
+      bots[botKey] = this.diagnosticsSnapshot(botKey);
+    }
+    return { ...bots[PRIMARY_BOT], bots };
+  }
+
+  // The next alarm is the earliest deadline across ALL bots: each
+  // bot's next heartbeat, reconnect, handshake watchdog, dispatch-
+  // silence deadline and outbox retry, plus the periodic self-start
+  // watchdog for configured bots. Callers save state before calling;
+  // the states are reloaded here so every bot contributes its own.
+  async scheduleAlarmLocked() {
     const now = Date.now();
     const candidates = [];
-    if (state.nextOutboxAt && !this._flushPromise) candidates.push(state.nextOutboxAt);
-    if (!state.reconnectBlocked && state.nextReconnectAt) candidates.push(state.nextReconnectAt);
-    if (state.nextHeartbeatAt) candidates.push(state.nextHeartbeatAt);
-    if (state.nextWatchdogAt) candidates.push(state.nextWatchdogAt);
-    if (state.ready && state.lastDispatchAt) {
-      candidates.push(state.lastDispatchAt + MAX_EVENT_SILENCE_MS);
+    for (const botKey of BOT_KEYS) {
+      const state = this.loadState(botKey);
+      if (state.nextOutboxAt && !this._flushPromise) candidates.push(state.nextOutboxAt);
+      if (!state.reconnectBlocked && state.nextReconnectAt) candidates.push(state.nextReconnectAt);
+      if (state.nextHeartbeatAt) candidates.push(state.nextHeartbeatAt);
+      if (state.nextWatchdogAt) candidates.push(state.nextWatchdogAt);
+      if (state.ready && state.lastDispatchAt) {
+        candidates.push(state.lastDispatchAt + MAX_EVENT_SILENCE_MS);
+      }
+      if (this.isConfigured(botKey) && !state.reconnectBlocked) candidates.push(now + 60000); // watchdog
     }
-    if (this.isConfigured() && !state.reconnectBlocked) candidates.push(now + 60000); // watchdog
     if (!candidates.length) {
       await this.ctx.storage.deleteAlarm();
       return;
@@ -862,12 +1053,38 @@ export class Gateway extends DurableObject {
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/internal/status" && request.method === "GET") {
-      return this.runLocked(async () => jsonResponse(this.statusSnapshot()));
+      return this.runLocked(async () => {
+        const bots = {};
+        for (const botKey of BOT_KEYS) {
+          bots[botKey] = this.statusSnapshot(botKey);
+        }
+        const primary = bots[PRIMARY_BOT];
+        return jsonResponse({
+          connected: primary.connected,
+          ready: primary.ready,
+          bots,
+        });
+      });
     }
     if (url.pathname === "/internal/connect" && request.method === "POST") {
+      let bot = null;
+      try {
+        const body = await request.json();
+        if (body && typeof body.bot === "string" && BOT_CONFIGS[body.bot]) {
+          bot = body.bot;
+        }
+      } catch (_) {
+        /* no body: nudge every bot */
+      }
       return this.runLocked(async () => {
-        await this.connectLocked({ manual: true });
-        return jsonResponse(this.diagnosticsSnapshot());
+        if (bot) {
+          await this.connectLocked(bot, { manual: true });
+        } else {
+          for (const botKey of BOT_KEYS) {
+            await this.connectLocked(botKey, { manual: true });
+          }
+        }
+        return jsonResponse(this.diagnosticsResponse());
       });
     }
     return new Response("not found", { status: 404 });
@@ -875,7 +1092,7 @@ export class Gateway extends DurableObject {
 
   // --- connection management (callers hold the lock) ---
 
-  async gatewayUrlForConnect(state) {
+  async gatewayUrlForConnect(botKey, state) {
     if (
       state.resumeMode === "resume" &&
       state.sessionId &&
@@ -886,7 +1103,7 @@ export class Gateway extends DurableObject {
     let base = state.gatewayUrl || DEFAULT_GATEWAY_URL;
     try {
       const res = await fetch(`${DISCORD_API_BASE}/gateway/bot`, {
-        headers: { Authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}` },
+        headers: { Authorization: `Bot ${this.env[BOT_CONFIGS[botKey].tokenEnv]}` },
         redirect: "manual",
         signal: AbortSignal.timeout(10000),
       });
@@ -905,42 +1122,44 @@ export class Gateway extends DurableObject {
     return withGatewayParams(base);
   }
 
-  async connectLocked({ manual = false } = {}) {
-    let state = this.loadState();
+  async connectLocked(botKey = PRIMARY_BOT, { manual = false } = {}) {
+    const config = BOT_CONFIGS[botKey];
+    let state = this.loadState(botKey);
     if (manual) state.reconnectBlocked = false;
-    if (state.reconnectBlocked) return this.statusSnapshot();
-    state.configured = this.isConfigured();
+    if (state.reconnectBlocked) return this.statusSnapshot(botKey);
+    state.configured = this.isConfigured(botKey);
     if (!state.configured) {
       state.connected = false;
       state.ready = false;
-      state.lastError = `missing DISCORD_BOT_TOKEN or ${forwardSecretName(this.env)}`;
-      this.saveState(state);
-      return this.statusSnapshot();
+      state.lastError = `missing ${config.tokenEnv} or ${config.forwardSecretEnv}`;
+      this.saveState(state, botKey);
+      return this.statusSnapshot(botKey);
     }
-    const existing = this.getGatewaySocket();
+    const existing = this.getGatewaySocket(botKey);
     if (existing) {
       state.connected = true;
-      this.saveState(state);
-      await this.scheduleAlarmLocked(state);
-      return this.statusSnapshot();
+      this.saveState(state, botKey);
+      await this.scheduleAlarmLocked();
+      return this.statusSnapshot(botKey);
     }
-    if (this._socket) this.closeGatewaySocket(this._socket, "replaced");
+    const stale = this._sockets[botKey]?.ws;
+    if (stale) this.closeGatewaySocket(botKey, stale, "replaced");
     state.lastConnectAttemptAt = Date.now();
     state.reconnectAttempts = (state.reconnectAttempts || 0) + 1;
-    const url = await this.gatewayUrlForConnect(state);
+    const url = await this.gatewayUrlForConnect(botKey, state);
     try {
       const ws = await openGatewaySocket(fetch, url);
-      this._socket = ws;
-      this._socketMode = attachGatewaySocket({
+      const mode = attachGatewaySocket({
         ctx: this.ctx,
         ws,
         handlers: {
-          onMessage: (data) => this.ctx.waitUntil(this.handleSocketMessage(ws, data)),
+          onMessage: (data) => this.ctx.waitUntil(this.handleSocketMessage(botKey, ws, data)),
           onClose: (code, reason, wasClean) =>
-            this.ctx.waitUntil(this.handleSocketClose(ws, code, reason, wasClean)),
-          onError: (error) => this.ctx.waitUntil(this.handleSocketError(ws, error)),
+            this.ctx.waitUntil(this.handleSocketClose(botKey, ws, code, reason, wasClean)),
+          onError: (error) => this.ctx.waitUntil(this.handleSocketError(botKey, ws, error)),
         },
       });
+      this._sockets[botKey] = { ws, mode };
       state.connected = true;
       state.ready = false;
       state.helloReceived = false;
@@ -952,7 +1171,8 @@ export class Gateway extends DurableObject {
       state.nextWatchdogAt = Date.now() + 30000; // hello timeout watchdog
       state.lastError = null;
     } catch (e) {
-      if (this._socket) this.closeGatewaySocket(this._socket, "connection failed");
+      const failed = this._sockets[botKey]?.ws;
+      if (failed) this.closeGatewaySocket(botKey, failed, "connection failed");
       state.connected = false;
       state.ready = false;
       state.lastError = `gateway connect failed: ${String(e).slice(0, 120)}`;
@@ -962,9 +1182,9 @@ export class Gateway extends DurableObject {
       );
       state.nextReconnectAt = Date.now() + delay;
     }
-    state = this.saveState(state);
-    await this.scheduleAlarmLocked(state);
-    return this.statusSnapshot();
+    state = this.saveState(state, botKey);
+    await this.scheduleAlarmLocked();
+    return this.statusSnapshot(botKey);
   }
 
   // --- gateway event handling ---
@@ -973,12 +1193,13 @@ export class Gateway extends DurableObject {
   // the same internal handleSocket* processing path.
 
   async webSocketMessage(ws, message) {
-    return this.handleSocketMessage(ws, message);
+    const botKey = this.botKeyForSocket(ws);
+    if (botKey) return this.handleSocketMessage(botKey, ws, message);
   }
 
-  async handleSocketMessage(ws, message) {
+  async handleSocketMessage(botKey, ws, message) {
     await this.runLocked(async () => {
-      if (ws !== this._socket) return; // ignore a replaced connection
+      if (ws !== this._sockets[botKey]?.ws) return; // ignore a replaced connection
       let payload;
       try {
         const text =
@@ -989,24 +1210,24 @@ export class Gateway extends DurableObject {
       } catch (_) {
         return;
       }
-      const state = this.loadState();
+      const state = this.loadState(botKey);
       const { state: nextState, actions } = handleGatewayPayload(state, payload, {
         now: Date.now(),
       });
       if (!actions.some(action => action.type === "close_socket")) nextState.connected = true;
-      this.saveState(nextState);
-      await this.executeGatewayActions(ws, nextState, actions);
-      const current = this.loadState();
-      await this.scheduleAlarmLocked(current);
+      this.saveState(nextState, botKey);
+      await this.executeGatewayActions(botKey, ws, nextState, actions);
+      await this.scheduleAlarmLocked();
     });
   }
 
-  async executeGatewayActions(ws, state, actions) {
+  async executeGatewayActions(botKey, ws, state, actions) {
+    const token = this.env[BOT_CONFIGS[botKey].tokenEnv];
     for (const action of actions) {
       if (action.type === "identify") {
         try {
           ws.send(
-            JSON.stringify({ op: 2, d: identifyPayload(this.env.DISCORD_BOT_TOKEN) })
+            JSON.stringify({ op: 2, d: identifyPayload(token) })
           );
         } catch (_) {
           /* socket went away; close handler will schedule a reconnect */
@@ -1018,7 +1239,7 @@ export class Gateway extends DurableObject {
               JSON.stringify({
                 op: 6,
                 d: {
-                  token: this.env.DISCORD_BOT_TOKEN,
+                  token,
                   session_id: state.sessionId,
                   seq: state.seq,
                 },
@@ -1035,24 +1256,24 @@ export class Gateway extends DurableObject {
           /* as above */
         }
       } else if (action.type === "forward") {
-        await this.enqueueForward(action.request);
+        await this.enqueueForward(action.request, botKey);
       } else if (action.type === "close_socket") {
-        this.closeGatewaySocket(ws, "reconnecting");
+        this.closeGatewaySocket(botKey, ws, "reconnecting");
       }
       // "schedule_alarm" is handled by the caller after all actions.
     }
   }
 
   async webSocketClose(ws, code, reason, wasClean) {
-    return this.handleSocketClose(ws, code, reason, wasClean);
+    const botKey = this.botKeyForSocket(ws);
+    if (botKey) return this.handleSocketClose(botKey, ws, code, reason, wasClean);
   }
 
-  async handleSocketClose(ws, code, reason, wasClean) {
+  async handleSocketClose(botKey, ws, code, reason, wasClean) {
     await this.runLocked(async () => {
-      if (ws !== this._socket) return;
-      this._socket = null;
-      this._socketMode = null;
-      const state = this.loadState();
+      if (ws !== this._sockets[botKey]?.ws) return;
+      this._sockets[botKey] = null;
+      const state = this.loadState(botKey);
       state.connected = false;
       state.ready = false;
       if (state.expectingClose && state.nextReconnectAt) {
@@ -1061,8 +1282,8 @@ export class Gateway extends DurableObject {
         state.helloReceived = false;
         state.awaitingHeartbeatAck = false;
         state.expectingClose = false;
-        const saved = this.saveState(state);
-        await this.scheduleAlarmLocked(saved);
+        this.saveState(state, botKey);
+        await this.scheduleAlarmLocked();
         return;
       }
       if (
@@ -1072,37 +1293,38 @@ export class Gateway extends DurableObject {
       ) {
         // An error handler already scheduled the reconnect; don't
         // double-count the attempt.
-        const saved = this.saveState(state);
-        await this.scheduleAlarmLocked(saved);
+        this.saveState(state, botKey);
+        await this.scheduleAlarmLocked();
         return;
       }
       const decision = reconnectDecisionForClose(state, code, Date.now());
-      const saved = this.saveState(decision.state);
-      await this.scheduleAlarmLocked(saved);
+      this.saveState(decision.state, botKey);
+      await this.scheduleAlarmLocked();
     });
   }
 
   async webSocketError(ws, error) {
-    return this.handleSocketError(ws, error);
+    const botKey = this.botKeyForSocket(ws);
+    if (botKey) return this.handleSocketError(botKey, ws, error);
   }
 
-  async handleSocketError(ws, error) {
+  async handleSocketError(botKey, ws, error) {
     await this.runLocked(async () => {
-      if (ws !== this._socket) return;
-      this.closeGatewaySocket(ws, "socket error");
-      const state = this.loadState();
+      if (ws !== this._sockets[botKey]?.ws) return;
+      this.closeGatewaySocket(botKey, ws, "socket error");
+      const state = this.loadState(botKey);
       state.connected = false;
       state.ready = false;
       state.lastError = "gateway socket error";
       if (!state.nextReconnectAt || state.nextReconnectAt <= Date.now()) {
         const decision = reconnectDecisionForClose(state, 1006, Date.now());
         decision.state.lastError = "gateway socket error";
-        const saved = this.saveState(decision.state);
-        await this.scheduleAlarmLocked(saved);
+        this.saveState(decision.state, botKey);
+        await this.scheduleAlarmLocked();
         return;
       }
-      const saved = this.saveState(state);
-      await this.scheduleAlarmLocked(saved);
+      this.saveState(state, botKey);
+      await this.scheduleAlarmLocked();
     });
   }
 
@@ -1111,94 +1333,104 @@ export class Gateway extends DurableObject {
   async alarm() {
     await this.runLocked(async () => {
       const now = Date.now();
-      let state = this.loadState();
-      state.lastAlarmAt = now;
-      this.saveState(state);
-
-      const socket = this.getGatewaySocket();
-      if (!socket) {
-        state.connected = false;
-        state.ready = false;
-        this.saveState(state);
-        if (
-          this.isConfigured() && !state.reconnectBlocked &&
-          (state.nextReconnectAt === null || state.nextReconnectAt <= Date.now())
-        ) {
-          await this.connectLocked();
-        }
-      } else if (
-        !state.ready && state.nextWatchdogAt && now >= state.nextWatchdogAt
-      ) {
-        // Hello/Identify/Resume did not complete in time: treat as dead.
-        state.resumeMode = state.sessionId ? "resume" : "identify";
-        state.helloReceived = false;
-        state.nextHeartbeatAt = null;
-        state.nextWatchdogAt = null;
-        state.nextReconnectAt = now + 1000;
-        state.connected = false;
-        state.ready = false;
-        state.lastError = "gateway handshake timeout";
-        this.saveState(state);
-        this.closeGatewaySocket(socket, "handshake timeout");
-      } else if (
-        state.helloReceived &&
-        eventSilenceDecision(state, now).action === "reconnect"
-      ) {
-        // Heartbeats are ACKed but no dispatch has arrived for hours:
-        // the socket is deaf. Close and resume (Hermes' liveness probe
-        // does the equivalent against discord.py).
-        state.resumeMode = state.sessionId ? "resume" : "identify";
-        state.helloReceived = false;
-        state.nextHeartbeatAt = null;
-        state.nextWatchdogAt = null;
-        state.nextReconnectAt = now + 1000;
-        state.connected = false;
-        state.ready = false;
-        state.lastError = "gateway dispatch silence: forcing reconnect";
-        this.saveState(state);
-        this.closeGatewaySocket(socket, "dispatch silence");
-      } else if (
-        state.helloReceived &&
-        state.nextHeartbeatAt &&
-        state.nextHeartbeatAt <= now
-      ) {
-        const decision = heartbeatDecision(state, now);
-        if (decision.action === "reconnect") {
-          const next = decision.state;
-          next.resumeMode = next.sessionId ? "resume" : "identify";
-          next.helloReceived = false;
-          next.nextHeartbeatAt = null;
-          next.nextWatchdogAt = null;
-          next.nextReconnectAt = now + 1000;
-          next.connected = false;
-          this.saveState(next);
-          this.closeGatewaySocket(socket, "heartbeat ack timeout");
-        } else if (decision.action === "send_heartbeat") {
-          const next = decision.state;
-          try {
-            socket.send(JSON.stringify(decision.payload));
-          } catch (e) {
-            next.lastError = `heartbeat send failed: ${String(e).slice(0, 120)}`;
-          }
-          this.saveState(next);
-        }
+      for (const botKey of BOT_KEYS) {
+        await this.alarmBotLocked(botKey, now);
       }
-
-      const current = this.loadState();
-      await this.scheduleAlarmLocked(current);
+      await this.scheduleAlarmLocked();
     });
     // Network delivery must never hold the protocol lock: a slow webhook
     // must not prevent heartbeat ACKs, reconnects, or status requests.
     this.ctx.waitUntil(this.flushOutbox());
   }
 
+  // One bot's alarm pass. The decision tree is the single-bot one,
+  // applied to this bot's own state and socket only: a bot that is not
+  // configured is skipped entirely (no connection attempt, no error),
+  // and one bot's reconnect or heartbeat never touches the other's
+  // session.
+  async alarmBotLocked(botKey, now) {
+    let state = this.loadState(botKey);
+    state.lastAlarmAt = now;
+    this.saveState(state, botKey);
+
+    const socket = this.getGatewaySocket(botKey);
+    if (!socket) {
+      state.connected = false;
+      state.ready = false;
+      this.saveState(state, botKey);
+      if (
+        this.isConfigured(botKey) && !state.reconnectBlocked &&
+        (state.nextReconnectAt === null || state.nextReconnectAt <= now)
+      ) {
+        await this.connectLocked(botKey);
+      }
+    } else if (
+      !state.ready && state.nextWatchdogAt && now >= state.nextWatchdogAt
+    ) {
+      // Hello/Identify/Resume did not complete in time: treat as dead.
+      state.resumeMode = state.sessionId ? "resume" : "identify";
+      state.helloReceived = false;
+      state.nextHeartbeatAt = null;
+      state.nextWatchdogAt = null;
+      state.nextReconnectAt = now + 1000;
+      state.connected = false;
+      state.ready = false;
+      state.lastError = "gateway handshake timeout";
+      this.saveState(state, botKey);
+      this.closeGatewaySocket(botKey, socket, "handshake timeout");
+    } else if (
+      state.helloReceived &&
+      eventSilenceDecision(state, now).action === "reconnect"
+    ) {
+      // Heartbeats are ACKed but no dispatch has arrived for hours:
+      // the socket is deaf. Close and resume (Hermes' liveness probe
+      // does the equivalent against discord.py).
+      state.resumeMode = state.sessionId ? "resume" : "identify";
+      state.helloReceived = false;
+      state.nextHeartbeatAt = null;
+      state.nextWatchdogAt = null;
+      state.nextReconnectAt = now + 1000;
+      state.connected = false;
+      state.ready = false;
+      state.lastError = "gateway dispatch silence: forcing reconnect";
+      this.saveState(state, botKey);
+      this.closeGatewaySocket(botKey, socket, "dispatch silence");
+    } else if (
+      state.helloReceived &&
+      state.nextHeartbeatAt &&
+      state.nextHeartbeatAt <= now
+    ) {
+      const decision = heartbeatDecision(state, now);
+      if (decision.action === "reconnect") {
+        const next = decision.state;
+        next.resumeMode = next.sessionId ? "resume" : "identify";
+        next.helloReceived = false;
+        next.nextHeartbeatAt = null;
+        next.nextWatchdogAt = null;
+        next.nextReconnectAt = now + 1000;
+        next.connected = false;
+        this.saveState(next, botKey);
+        this.closeGatewaySocket(botKey, socket, "heartbeat ack timeout");
+      } else if (decision.action === "send_heartbeat") {
+        const next = decision.state;
+        try {
+          socket.send(JSON.stringify(decision.payload));
+        } catch (e) {
+          next.lastError = `heartbeat send failed: ${String(e).slice(0, 120)}`;
+        }
+        this.saveState(next, botKey);
+      }
+    }
+  }
+
   // --- forwarding outbox (SQLite) ---
 
-  insertOutbox(request) {
+  insertOutbox(request, botKey) {
     const now = Date.now();
     this.ctx.storage.sql.exec(
-      "INSERT OR IGNORE INTO outbox (request_id, body, attempts, next_attempt_at, created_at) " +
-        "VALUES (?, ?, 0, ?, ?)",
+      "INSERT OR IGNORE INTO outbox (bot, request_id, body, attempts, next_attempt_at, created_at) " +
+        "VALUES (?, ?, ?, 0, ?, ?)",
+      botKey,
       request.request_id,
       JSON.stringify(request),
       now,
@@ -1206,106 +1438,134 @@ export class Gateway extends DurableObject {
     );
   }
 
-  earliestOutboxAt() {
-    const rows = this.ctx.storage.sql
-      .exec("SELECT MIN(next_attempt_at) AS m FROM outbox")
-      .toArray();
+  earliestOutboxAt(botKey) {
+    const rows = botKey
+      ? this.ctx.storage.sql
+          .exec(
+            "SELECT MIN(next_attempt_at) AS m FROM outbox WHERE bot = ?",
+            botKey
+          )
+          .toArray()
+      : this.ctx.storage.sql
+          .exec("SELECT MIN(next_attempt_at) AS m FROM outbox")
+          .toArray();
     const m = rows[0]?.m;
     return typeof m === "number" ? m : null;
   }
 
-  async enqueueForward(request) {
+  async enqueueForward(request, botKey = PRIMARY_BOT) {
     // Resume replays: a message already forwarded (or already queued)
-    // must not be filed twice. The outbox primary key covers the
-    // queued case; forward_log covers the completed case.
+    // must not be filed twice — per bot, since the same Discord
+    // message may legitimately be filed once by EACH bot. The outbox
+    // primary key covers the queued case; forward_log covers the
+    // completed case.
     const seen = this.ctx.storage.sql
       .exec(
-        "SELECT request_id FROM forward_log WHERE request_id = ?",
+        "SELECT request_id FROM forward_log WHERE bot = ? AND request_id = ?",
+        botKey,
         request.request_id
       )
       .toArray();
     if (seen.length) return;
-    this.insertOutbox(request);
-    const state = this.loadState();
+    this.insertOutbox(request, botKey);
+    const state = this.loadState(botKey);
     state.nextOutboxAt = Date.now();
-    this.saveState(state);
+    this.saveState(state, botKey);
     // The caller arms an immediate alarm after persisting this row.
   }
 
-  // POST due outbox rows to dots-events, in the deployment's forward
+  // POST due outbox rows to dots-events, each in its own bot's forward
   // mode (see attemptForward). The receiver deduplicates by the body's
   // request_id, so retries never file a request twice.
   async flushOutbox() {
     if (this._flushPromise) return this._flushPromise;
     this._flushPromise = this.deliverOutbox().finally(async () => {
       this._flushPromise = null;
-      await this.runLocked(() => this.scheduleAlarmLocked(this.loadState()));
+      await this.runLocked(() => this.scheduleAlarmLocked());
     });
     return this._flushPromise;
   }
 
   async deliverOutbox() {
-    const secret = forwardSecret(this.env);
-    if (!secret) {
-      await this.runLocked(() => {
-        const state = this.loadState();
-        state.lastForwardError = `missing ${forwardSecretName(this.env)}`;
-        state.nextOutboxAt = null;
-        this.saveState(state);
-      });
-      return;
-    }
     const rows = await this.runLocked(() => this.ctx.storage.sql.exec(
-      "SELECT request_id, body, attempts FROM outbox " +
+      "SELECT bot, request_id, body, attempts FROM outbox " +
       "WHERE next_attempt_at <= ? ORDER BY created_at ASC LIMIT 10", Date.now()
     ).toArray());
+    // Group by bot, preserving arrival order within each bot. A row
+    // whose bot is unknown (cannot happen with the current writers)
+    // is treated as the primary bot's.
+    const byBot = new Map();
     for (const row of rows) {
-      const attempts = row.attempts + 1;
-      let delayMs = Math.min(60000, 1000 * 2 ** attempts);
-      const result = await attemptForward({
-        env: this.env,
-        fetchImpl: fetch,
-        requestId: row.request_id,
-        body: row.body,
-      });
-      const ok = result.delivered;
-      const error = result.error;
-      if (result.retryAfterMs !== null && result.retryAfterMs !== undefined) {
-        delayMs = Math.max(delayMs, result.retryAfterMs);
+      const botKey = BOT_CONFIGS[row.bot] ? row.bot : PRIMARY_BOT;
+      if (!byBot.has(botKey)) byBot.set(botKey, []);
+      byBot.get(botKey).push(row);
+    }
+    for (const [botKey, botRows] of byBot) {
+      const config = BOT_CONFIGS[botKey];
+      if (!this.env[config.forwardSecretEnv]) {
+        // This bot's forward credential is gone: suspend its due
+        // timer and keep its rows queued, exactly as the single-bot
+        // version did deployment-wide. Other bots are unaffected.
+        await this.runLocked(() => {
+          const state = this.loadState(botKey);
+          state.lastForwardError = `missing ${config.forwardSecretEnv}`;
+          state.nextOutboxAt = null;
+          this.saveState(state, botKey);
+        });
+        continue;
       }
-      await this.runLocked(async () => {
-        // Reload after I/O so concurrent ACK/session changes are never overwritten.
-        const state = this.loadState();
-        state.lastForwardError = error;
-        if (ok || result.final || attempts >= MAX_FORWARD_ATTEMPTS) {
-          this.ctx.storage.sql.exec("DELETE FROM outbox WHERE request_id = ?", row.request_id);
-          if (ok || result.final) {
-            // forward_log dedups replays for a week. A final trigger
-            // failure (non-429 4xx) is logged here as failed — the
-            // request can never be filed, so a replay must not file
-            // it again — and counted as dropped below.
+      for (const row of botRows) {
+        const attempts = row.attempts + 1;
+        let delayMs = Math.min(60000, 1000 * 2 ** attempts);
+        const result = await attemptForward({
+          env: this.env,
+          bot: botKey,
+          fetchImpl: fetch,
+          requestId: row.request_id,
+          body: row.body,
+        });
+        const ok = result.delivered;
+        const error = result.error;
+        if (result.retryAfterMs !== null && result.retryAfterMs !== undefined) {
+          delayMs = Math.max(delayMs, result.retryAfterMs);
+        }
+        await this.runLocked(async () => {
+          // Reload after I/O so concurrent ACK/session changes are never overwritten.
+          const state = this.loadState(botKey);
+          state.lastForwardError = error;
+          if (ok || result.final || attempts >= MAX_FORWARD_ATTEMPTS) {
             this.ctx.storage.sql.exec(
-              "INSERT OR REPLACE INTO forward_log (request_id, completed_at) VALUES (?, ?)",
-              row.request_id, Date.now()
+              "DELETE FROM outbox WHERE bot = ? AND request_id = ?",
+              botKey, row.request_id
+            );
+            if (ok || result.final) {
+              // forward_log dedups replays for a week. A final trigger
+              // failure (non-429 4xx) is logged here as failed — the
+              // request can never be filed, so a replay must not file
+              // it again — and counted as dropped below.
+              this.ctx.storage.sql.exec(
+                "INSERT OR REPLACE INTO forward_log (bot, request_id, completed_at) VALUES (?, ?, ?)",
+                botKey, row.request_id, Date.now()
+              );
+            }
+            if (ok) {
+              state.forwardedCount += 1;
+              state.lastForwardAt = Date.now();
+            } else state.droppedForwardCount += 1;
+          } else {
+            this.ctx.storage.sql.exec(
+              "UPDATE outbox SET attempts = ?, next_attempt_at = ? WHERE bot = ? AND request_id = ?",
+              attempts, Date.now() + delayMs, botKey, row.request_id
             );
           }
-          if (ok) {
-            state.forwardedCount += 1;
-            state.lastForwardAt = Date.now();
-          } else state.droppedForwardCount += 1;
-        } else {
           this.ctx.storage.sql.exec(
-            "UPDATE outbox SET attempts = ?, next_attempt_at = ? WHERE request_id = ?",
-            attempts, Date.now() + delayMs, row.request_id
+            "DELETE FROM forward_log WHERE completed_at < ?", Date.now() - 7 * 24 * 60 * 60 * 1000
           );
-        }
-        this.ctx.storage.sql.exec(
-          "DELETE FROM forward_log WHERE completed_at < ?", Date.now() - 7 * 24 * 60 * 60 * 1000
-        );
-        state.nextOutboxAt = this.earliestOutboxAt();
-        this.saveState(state);
-        await this.scheduleAlarmLocked(state);
-      });
+          state.nextOutboxAt = this.earliestOutboxAt(botKey);
+          this.saveState(state, botKey);
+          await this.scheduleAlarmLocked();
+        });
+      }
     }
   }
 
@@ -1461,6 +1721,16 @@ export async function patchBotAvatar(fetchImpl, token, mediaType, base64Data) {
   return { status: res.status, user, bodyText: text };
 }
 
+// Resolve the optional "bot" field of an admin request body to a bot
+// key: absent (or null) selects the primary bot; a known bot name
+// selects that bot; anything else is null, which callers turn into a
+// 400 — a typo must never silently post as the wrong bot.
+function selectBotKey(body) {
+  const bot = body?.bot;
+  if (bot === undefined || bot === null) return PRIMARY_BOT;
+  return typeof bot === "string" && BOT_CONFIGS[bot] ? bot : null;
+}
+
 async function handleAvatar(env, request) {
   if (!isAdminKey(env, request)) {
     return jsonResponse({ error: "unauthorized" }, 401);
@@ -1471,7 +1741,12 @@ async function handleAvatar(env, request) {
   } catch (_) {
     return jsonResponse({ error: "invalid JSON body" }, 400);
   }
-  if (!env.DISCORD_BOT_TOKEN) {
+  const botKey = selectBotKey(body);
+  if (!botKey) {
+    return jsonResponse({ error: "unknown bot" }, 400);
+  }
+  const botToken = env[BOT_CONFIGS[botKey].tokenEnv];
+  if (!botToken) {
     return jsonResponse({ error: "discord bot not configured" }, 500);
   }
   let bytes = null;
@@ -1545,7 +1820,7 @@ async function handleAvatar(env, request) {
   }
   const result = await patchBotAvatar(
     fetch,
-    env.DISCORD_BOT_TOKEN,
+    botToken,
     mediaType,
     base64Data
   );
@@ -1588,6 +1863,10 @@ async function handleSend(env, request) {
   } catch (_) {
     return jsonResponse({ error: "invalid JSON body" }, 400);
   }
+  const botKey = selectBotKey(body);
+  if (!botKey) {
+    return jsonResponse({ error: "unknown bot" }, 400);
+  }
   const channelId =
     typeof body?.channel_id === "string" ? body.channel_id.trim() : "";
   if (!/^\d{5,32}$/.test(channelId)) {
@@ -1597,7 +1876,8 @@ async function handleSend(env, request) {
   if (!rawContent.trim()) {
     return jsonResponse({ error: "content is required" }, 400);
   }
-  if (!env.DISCORD_BOT_TOKEN) {
+  const botToken = env[BOT_CONFIGS[botKey].tokenEnv];
+  if (!botToken) {
     return jsonResponse({ error: "discord bot not configured" }, 500);
   }
   // Split long content into <=2000-char messages instead of silently
@@ -1616,7 +1896,7 @@ async function handleSend(env, request) {
         {
           method: "POST",
           headers: {
-            Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+            Authorization: `Bot ${botToken}`,
             "Content-Type": "application/json",
           },
           body: JSON.stringify({ content: chunks[i], allowed_mentions: { parse: [] } }),
@@ -1693,8 +1973,10 @@ export default {
         return jsonResponse({ ok: true, service: SERVICE_NAME, version: SERVICE_VERSION });
       }
       if (url.pathname === "/status" && request.method === "GET") {
-        // Public liveness view from the Durable Object: exactly
-        // {connected, ready} — no ids, no state detail, no secrets.
+        // Public liveness view from the Durable Object: the primary
+        // bot's {connected, ready} at top level (the legacy shape),
+        // plus a "bots" map with each bot's {connected, ready,
+        // configured} — no ids, no failure detail, no secrets.
         const res = await gatewayStub(env).fetch(
           "https://gateway/internal/status"
         );
@@ -1708,9 +1990,37 @@ export default {
         if (!isAdminKey(env, request)) {
           return jsonResponse({ error: "unauthorized" }, 401);
         }
+        // Optional JSON body {"bot": "<name>"} nudges one bot; no
+        // body (or no bot field) nudges all of them. An unknown bot
+        // name is a 400, never a silent nudge of the wrong bot.
+        let bot = null;
+        let rawBody = "";
+        try {
+          rawBody = await request.text();
+        } catch (_) {
+          /* unreadable body: treat as empty */
+        }
+        if (rawBody && rawBody.trim()) {
+          let parsed = null;
+          try {
+            parsed = JSON.parse(rawBody);
+          } catch (_) {
+            return jsonResponse({ error: "invalid JSON body" }, 400);
+          }
+          if (parsed && parsed.bot !== undefined && parsed.bot !== null) {
+            if (typeof parsed.bot !== "string" || !BOT_CONFIGS[parsed.bot]) {
+              return jsonResponse({ error: "unknown bot" }, 400);
+            }
+            bot = parsed.bot;
+          }
+        }
         const res = await gatewayStub(env).fetch(
           "https://gateway/internal/connect",
-          { method: "POST" }
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(bot ? { bot } : {}),
+          }
         );
         const body = await res.text();
         return new Response(body, {

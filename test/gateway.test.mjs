@@ -493,13 +493,25 @@ async function send(bodyObj, key) {
   return { status: res.status, json };
 }
 
-test("http: /status is public and exposes exactly {connected, ready}", async () => {
+test("http: /status is public: legacy {connected, ready} plus per-bot detail", async () => {
   const res = await mf.dispatchFetch(ORIGIN + "/status");
   assert.equal(res.status, 200);
   const j = await res.json();
-  assert.deepEqual(Object.keys(j).sort(), ["connected", "ready"]);
+  assert.deepEqual(Object.keys(j).sort(), ["bots", "connected", "ready"]);
   assert.equal(j.connected, false);
   assert.equal(j.ready, false);
+  // croissand is configured by this suite's bindings; ichihime is not
+  // (its token/trigger key are unset here), so it reports idle.
+  assert.deepEqual(j.bots.croissand, {
+    connected: false,
+    ready: false,
+    configured: true,
+  });
+  assert.deepEqual(j.bots.ichihime, {
+    connected: false,
+    ready: false,
+    configured: false,
+  });
 });
 
 test("http: /send rejects missing and wrong admin keys with 401", async () => {
@@ -746,10 +758,13 @@ test("http: /connect with the admin key returns diagnostics including lastError"
   assert.ok(j.lastError === null || typeof j.lastError === "string");
   assert.equal(typeof j.hasSession, "boolean");
   assert.ok(j.lastDispatchAt === null || typeof j.lastDispatchAt === "number");
-  // The public /status still exposes exactly the two keys afterwards.
+  // The diagnostics carry a per-bot map; the public /status keeps the
+  // legacy top-level fields (with the new "bots" detail) afterwards.
+  assert.equal(typeof j.bots.croissand.connected, "boolean");
+  assert.equal(typeof j.bots.ichihime.connected, "boolean");
   const pubRes = await mf.dispatchFetch(ORIGIN + "/status");
   const pub = await pubRes.json();
-  assert.deepEqual(Object.keys(pub).sort(), ["connected", "ready"]);
+  assert.deepEqual(Object.keys(pub).sort(), ["bots", "connected", "ready"]);
 });
 
 async function avatar(bodyObj, key) {
@@ -860,6 +875,15 @@ test('outbox: missing signing secret suspends the due timer without deleting que
   let state={...DS,nextOutboxAt:NOW-1};
   gateway.loadState=()=>({...state});
   gateway.saveState=s=>(state={...s});
+  // One due croissand row; with no CLAUDE_HOOK_SECRET in env the
+  // delivery pass must stamp the error on croissand's state and keep
+  // the row queued (no SQL writes beyond the due-row read).
+  gateway.ctx={storage:{sql:{exec:(sql)=>{
+    if(sql.startsWith('SELECT bot, request_id, body, attempts FROM outbox')){
+      return {toArray:()=>[{bot:'croissand',request_id:'discord-1',body:'{}',attempts:0}]};
+    }
+    throw new Error('unexpected SQL in test: '+sql);
+  }}}};
   await gateway.deliverOutbox();
   assert.equal(state.nextOutboxAt,null);
   assert.equal(state.lastForwardError,'missing CLAUDE_HOOK_SECRET');
@@ -873,13 +897,12 @@ test('gateway: callbacks from a replaced socket cannot mutate the live session',
   const gateway = Object.create(pure.Gateway.prototype);
   const current = {readyState:1};
   const stale = {readyState:3};
-  gateway._socket=current;
-  gateway._socketMode='inline';
+  gateway._sockets={croissand:{ws:current,mode:'inline'}};
   gateway._lock=Promise.resolve();
   gateway.loadState=()=>assert.fail('stale callback must return before reading state');
-  await gateway.handleSocketMessage(stale,JSON.stringify({op:0,s:1,t:'READY',d:{session_id:'stale'}}));
-  await gateway.handleSocketClose(stale,4004,'stale',true);
-  await gateway.handleSocketError(stale,new Error('stale'));
-  assert.equal(gateway._socket,current);
-  assert.equal(gateway._socketMode,'inline');
+  await gateway.handleSocketMessage('croissand',stale,JSON.stringify({op:0,s:1,t:'READY',d:{session_id:'stale'}}));
+  await gateway.handleSocketClose('croissand',stale,4004,'stale',true);
+  await gateway.handleSocketError('croissand',stale,new Error('stale'));
+  assert.equal(gateway._sockets.croissand.ws,current);
+  assert.equal(gateway._sockets.croissand.mode,'inline');
 });

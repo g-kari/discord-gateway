@@ -15,18 +15,23 @@ tag = "v1"
 new_sqlite_classes = ["Gateway"]
 
 # Secrets (set with `wrangler secret put` — never write values here):
-#   DISCORD_BOT_TOKEN   Discord bot token (Bot authorization)
-#   CLAUDE_HOOK_SECRET  whsec_ HMAC secret shared with dots-events'
-#                       POST /claude-hook receiver
-#                       (FORWARD_MODE=claude-hook, the default)
-#   EVENTS_TRIGGER_KEY  Bearer key for dots-events' POST /trigger
-#                       (FORWARD_MODE=trigger; second-bot deployments)
-#   ADMIN_KEY           admin key for POST /connect and POST /send
+#   DISCORD_BOT_TOKEN           croissand's Discord bot token
+#   DISCORD_BOT_TOKEN_ICHICHIME ichihime's Discord bot token
+#                               (set only when enabling ichihime)
+#   CLAUDE_HOOK_SECRET          whsec_ HMAC secret shared with dots-events'
+#                               POST /claude-hook receiver (croissand)
+#   EVENTS_TRIGGER_KEY          Bearer key for dots-events' POST /trigger
+#                               (ichihime; set only when enabling her)
+#   ADMIN_KEY                   admin key for POST /connect, /send, /avatar
 #
 # Vars:
-#   FORWARD_MODE        "claude-hook" (default) or "trigger"
+#   FORWARD_MODE        legacy fallback for bot-less attemptForward calls;
+#                       per-bot forward modes are fixed in worker.js now.
 #
 # Endpoints (once routed/deployed):
-#   GET  /status   public: {"connected": bool, "ready": bool} only
+#   GET  /status   public: {"connected", "ready"} for croissand plus a
+#                  per-bot "bots" detail (connected/ready/configured)
 #   POST /connect  admin key: nudge the Durable Object to (re)connect
+#                  (optional {"bot": "ichihime"} targets one bot)
 #   POST /send     admin key: post a message to a Discord channel
+#                  (optional {"bot": "ichihime"} picks the sender)

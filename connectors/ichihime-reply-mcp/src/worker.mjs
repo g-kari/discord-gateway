@@ -3,6 +3,7 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { createMcpHandler } from 'agents/mcp/server';
 import { z } from 'zod';
 import { assertOwner, configuredTargets, READ_SCOPE, WRITE_SCOPE, toolError, toolResult } from './core.mjs';
+import { IDP_ISSUER, validateIdpToken } from './idp-auth.mjs';
 export { ReplyLedger } from './ledger.mjs';
 const replySchema = z.strictObject({
   source_message_id: z.string().regex(/^[1-9][0-9]{16,19}$/),
@@ -10,7 +11,7 @@ const replySchema = z.strictObject({
   content: z.string().min(1).max(2000)
 });
 function createServer(env, auth) {
-  const server = new McpServer({ name: 'ichihime-discord-reply', version: '0.1.0' });
+  const server = new McpServer({ name: 'ichihime-discord-reply', version: '0.2.0' });
   server.registerTool('discord_reply_status', {
     description: 'Read this owner-only reply connector status and exact server-side allowed channels. Does not read Discord messages or reveal secrets.',
     inputSchema: z.strictObject({}), annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
@@ -42,16 +43,18 @@ function createServer(env, auth) {
 }
 export default {
   async fetch(request, env, ctx) {
-        if (!env.MCP_SERVER_URL || !env.AUTH_SERVER_URL || !env.AUTH_SERVER || !env.OWNER_SUBJECT) return Response.json({ error: 'not_configured' }, { status: 503 });
+    const jwtMode = env.AUTH_MODE === '0g0-id-jwt';
+    const rpcMode = env.AUTH_MODE === 'service-binding' && !!env.AUTH_SERVER;
+    if (!env.MCP_SERVER_URL || !env.AUTH_SERVER_URL || !env.OWNER_SUBJECT || (!jwtMode && !rpcMode) || (jwtMode && env.AUTH_SERVER_URL !== IDP_ISSUER)) return Response.json({ error: 'not_configured' }, { status: 503 });
     const configured = new URL(env.MCP_SERVER_URL);
     if (configured.protocol !== 'https:' || configured.pathname !== '/mcp' || configured.search || configured.hash || configured.username || configured.password || new URL(request.url).origin !== configured.origin) return new Response('Invalid resource', { status: 403 });
     const origin = request.headers.get('Origin');
     if (origin && origin !== configured.origin) return new Response('Invalid origin', { status: 403 });
     // No anonymous status/debug route, CORS wildcard, or key-auth fallback.
     const resource = new OAuthResourceServer({
-      resourceMetadata: { resource: env.MCP_SERVER_URL, authorization_servers: [env.AUTH_SERVER_URL] },
+      resourceMetadata: { resource: env.MCP_SERVER_URL, authorization_servers: [env.AUTH_SERVER_URL], bearer_methods_supported: ['header'] },
       requiredScopes: [READ_SCOPE], validateToken: e => async (resource, token) => {
-        const verified = await e.AUTH_SERVER.validateToken(resource, token);
+        const verified = jwtMode ? await validateIdpToken(resource, token) : await e.AUTH_SERVER.validateToken(resource, token);
         if (!verified || !Number.isFinite(verified.expiresAt) || verified.expiresAt <= Date.now() / 1000 || typeof verified.userId !== 'string' || !verified.userId || typeof verified.clientId !== 'string' || !verified.clientId) return null;
         return verified;
       },

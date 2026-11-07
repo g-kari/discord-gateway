@@ -1,20 +1,21 @@
 {
   "name": "ichihime-discord-reply-connector",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "test": "node --test checks/*.check.mjs",
-    "check": "node --check src/core.mjs && node --check src/ledger.mjs && node --check src/worker.mjs && node --check tools/package-plugin.mjs",
+    "check": "node --check src/core.mjs && node --check src/ledger.mjs && node --check src/idp-auth.mjs && node --check src/worker.mjs && node --check tools/package-plugin.mjs",
     "build": "esbuild src/worker.mjs --bundle --format=esm --platform=browser --conditions=workerd --external:cloudflare:* --external:node:* --outfile=dist/worker.mjs"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "1.2.4",
     "@modelcontextprotocol/server": "2.4.0",
     "agents": "0.33.0",
+    "jose": "6.2.15",
     "zod": "4.6.7"
   },
   "devDependencies": {

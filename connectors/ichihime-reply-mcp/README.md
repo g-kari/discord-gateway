@@ -8,7 +8,8 @@
 
 MCPクライアント → OAuth認証付き返信Worker → 永続ReplyLedger → private Service Binding → 既存Gateway `/send` → Discord
 
-- OAuthResourceServerがトークンのresource/audience、有効期限、検証失敗を処理します。本人subjectを完全一致で照合し、read/send scopeを各ツールで確認します。
+- 既存0g0-id（https://id.0g0.xyz）のES256 resource access tokenを、固定公開JWKSとjoseで検証します。issuer・単一audience・15分以内の期限/iat・sub/cid/scope/jtiを確認し、OAuthResourceServerへ必要最小限の認証結果だけを渡します。本人subjectとread/send scopeも完全照合します。
+- v0.2.0は0g0-id用JWT adapterを同梱し、認証用の新Worker・client secret・AUTH_SERVER bindingを必要としません。公開JWKSだけを最大5分保持し、新kidは30秒の間隔を置いて再取得します。詳細は `docs/idp-auth-contract.md`、独立レビューは `docs/idp-auth-review.md`。
 - 実ユーザーの本人確認とOAuth同意は、別途承認済みの認可サーバーが担当します。固定ユーザーを無認証で返す本番サーバーは含めません。合成試験の認証fixtureを本番に使わないでください。
 - Botは常に `ichihime`。クライアントはBot名・管理キー・送信URLを指定できません。
 - 送り先はサーバー設定の正確なguild/channel組だけです。DM、スレッド、任意URL、メンション、添付は受け付けません。許可リストのchannel typeは0（テキスト）/5（告知）に限定します。実メタデータの確認は有効化前に必要です。
@@ -50,7 +51,7 @@ workerd/Miniflare統合試験:
 
 ```sh
 npm install --no-save --package-lock=false --legacy-peer-deps miniflare@4.20260730.0
-node --test checks/runtime.integration.mjs
+node --test --test-concurrency=1 checks/*.integration.mjs
 ```
 
 `MINIFLARE_MODULE` で同じ公式Miniflareの既存ローカルモジュールを指定することもできます。統合試験の全ネットワーク先・OAuth token・管理キー・Discordレスポンスは合成です。実Discordへは通信しません。詳細は `docs/verification.md` を参照してください。
@@ -59,15 +60,17 @@ node --test checks/runtime.integration.mjs
 
 1. ソース、試験結果、`docs/security-and-activation.md` をレビューする。
 2. 既存Gatewayの配備バージョンと `/send` の `bot=ichihime` 契約を、許可された方法で確認する。version詳細のread拒否を、別API、URL、CLI、PC経由で迂回しない。
-3. 本人の個別承認を受けてから、認可サーバー、service binding、server-side secret、許可チャンネル、公開URLを構成する。対象・情報・アクセス範囲を明示する。既存の管理キーを会話や成果物に貼らない。
+3. 本人の個別承認を受けてから、0g0-idの限定resource登録、Gateway service binding、server-side secret、本人subject、許可チャンネル、公開URLを構成する。対象・情報・アクセス範囲を明示する。既存の管理キーを会話や成果物に貼らない。
 4. `SEND_ENABLED=false` のまま認証なし/別subjectの拒否、本人によるinitialize/tools/list/statusを確認する。
 5. 本人が指定した送り先と本文で1回だけ送信テストの許可を取り、送信とreceipt/重複試験を実施する。結果不明は再送せず照合する。
 6. 実在するHTTPS `/mcp` URLと正規MCP discoveryを確認した後だけ、`tools/package-plugin.mjs` で、実際に検証したOAuthクライアント方式（CIMD/DCR）を指定して接続パッケージを作る。未確認URLの仮コネクタは作成しない。
 
 共有・デプロイ・認証を自動実行するスクリプト、定期送信、Gateway再接続、avatar変更は含めていません。
 
-## GitHubでの配布
+## GitHub配布
 
-このディレクトリは独立した返信コネクタだけを格納します。既存Gatewayの実装・設定は変更しません。根のnode --testが子ディレクトリの試験を自動実行しないよう、試験をchecks/へ分離しています。
+最新版: [v0.2.0ソース配布ZIP](artifacts/ichihime-discord-reply-connector-v0.2.0-20261107.zip)
 
-レビュー済みの元配布ZIPは [artifacts/ichihime-discord-reply-connector-source-20261107.zip](artifacts/ichihime-discord-reply-connector-source-20261107.zip) です。SHA-256: 55d27a6f86979273423fc098844b23434a1ce7ad785ec3d2a226528c55cf6184。元ZIP内は単体プロジェクト用のtest/配置で、GitHubの展開ソースでは同じ試験をchecks/へ移しています。製品srcの内容は同一です。
+SHA-256: `ed9982e4044141c2637e1f16bde784e22d0960291ed9a426d2194bc7c9169fc0`
+
+元v0.1.0の配布ZIPは artifacts/ に保持し、内容とチェックサムを変更していません。GitHub版は根のNode test discoveryに干渉しないよう試験をchecks/と*.check.mjsへ移しています。製品srcは同一です。

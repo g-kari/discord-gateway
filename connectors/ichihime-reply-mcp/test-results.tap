@@ -1,47 +1,724 @@
-npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
-
-> ichihime-discord-reply-connector@0.1.0 test
-> node --test test/*.test.mjs
-
-✔ auth uses exact trusted owner and scope (1.420513ms)
-✔ strict server-side allowlist and exact channel input (1.149555ms)
-✔ rejects DM (0.195477ms)
-✔ rejects thread (0.098284ms)
-✔ rejects query (0.086276ms)
-✔ rejects fragment (0.087118ms)
-✔ rejects credential (0.130952ms)
-✔ rejects trailing (0.112435ms)
-✔ rejects lookalike (0.113096ms)
-✔ rejects http (0.263476ms)
-✔ rejects encode (0.127948ms)
-✔ rejects other guild or channel (0.312308ms)
-✔ cannot inject bot, sender, destination, authorization, URL or key (0.94132ms)
-✔ one bounded message, no mentions or control bytes (0.447155ms)
-✔ dedup key remains same across destination/content changes, digest changes (18.62622ms)
-✔ upstream URL/path, bot, body and secret are server controlled (3.317875ms)
-✔ preflight fail-closed without send enablement, secret, or binding (0.488586ms)
-✔ successful receipt persisted, retries and receipt queries never re-send (6.330732ms)
-✔ changed content or allowed destination cannot bypass same-source dedup (3.006037ms)
-✔ concurrent identical requests reserve once (5.989312ms)
-✔ network persists unknown and never auto-retries (2.074312ms)
-✔ 429 persists unknown and never auto-retries (1.495743ms)
-✔ 500 persists unknown and never auto-retries (2.147039ms)
-✔ redirect persists unknown and never auto-retries (1.871905ms)
-✔ malformed persists unknown and never auto-retries (1.23432ms)
-✔ wrong channel persists unknown and never auto-retries (2.930146ms)
-✔ numeric id persists unknown and never auto-retries (1.579536ms)
-✔ wrong bot persists unknown and never auto-retries (1.533283ms)
-✔ oversized persists unknown and never auto-retries (1.363544ms)
-✔ crash after durable reservation refuses retry across instance restart (19.455755ms)
-✔ failure to reserve does not send (1.334211ms)
-✔ failure to persist successful receipt still blocks retry (1.714965ms)
-✔ read scope cannot send; outsider and disabled target cannot send (1.595709ms)
-✔ unknown receipt is read-only (1.03705ms)
-ℹ tests 34
-ℹ suites 0
-ℹ pass 34
-ℹ fail 0
-ℹ cancelled 0
-ℹ skipped 0
-ℹ todo 0
-ℹ duration_ms 172.410711
+TAP version 13
+# Subtest: independent rejects single element aud array
+ok 1 - independent rejects single element aud array
+  ---
+  duration_ms: 17.327979
+  type: 'test'
+  ...
+# Subtest: independent rejects subject object
+ok 2 - independent rejects subject object
+  ---
+  duration_ms: 2.366854
+  type: 'test'
+  ...
+# Subtest: independent rejects subject whitespace
+ok 3 - independent rejects subject whitespace
+  ---
+  duration_ms: 2.575255
+  type: 'test'
+  ...
+# Subtest: independent rejects subject too long
+ok 4 - independent rejects subject too long
+  ---
+  duration_ms: 3.325485
+  type: 'test'
+  ...
+# Subtest: independent rejects client too long
+ok 5 - independent rejects client too long
+  ---
+  duration_ms: 3.737663
+  type: 'test'
+  ...
+# Subtest: independent rejects jti object
+ok 6 - independent rejects jti object
+  ---
+  duration_ms: 1.415726
+  type: 'test'
+  ...
+# Subtest: independent rejects scope tab
+ok 7 - independent rejects scope tab
+  ---
+  duration_ms: 1.37074
+  type: 'test'
+  ...
+# Subtest: independent rejects scope DEL
+ok 8 - independent rejects scope DEL
+  ---
+  duration_ms: 1.511818
+  type: 'test'
+  ...
+# Subtest: independent rejects scope quote
+ok 9 - independent rejects scope quote
+  ---
+  duration_ms: 2.112383
+  type: 'test'
+  ...
+# Subtest: independent rejects scope backslash
+ok 10 - independent rejects scope backslash
+  ---
+  duration_ms: 2.029932
+  type: 'test'
+  ...
+# Subtest: independent rejects too many scopes
+ok 11 - independent rejects too many scopes
+  ---
+  duration_ms: 1.283601
+  type: 'test'
+  ...
+# Subtest: independent rejects scope over limit
+ok 12 - independent rejects scope over limit
+  ---
+  duration_ms: 1.016918
+  type: 'test'
+  ...
+# Subtest: independent rejects signed exp=1e309
+ok 13 - independent rejects signed exp=1e309
+  ---
+  duration_ms: 1.054033
+  type: 'test'
+  ...
+# Subtest: independent rejects signed exp=-1e309
+ok 14 - independent rejects signed exp=-1e309
+  ---
+  duration_ms: 1.443367
+  type: 'test'
+  ...
+# Subtest: independent rejects signed iat=1e309
+ok 15 - independent rejects signed iat=1e309
+  ---
+  duration_ms: 1.100712
+  type: 'test'
+  ...
+# Subtest: independent rejects signed iat=-1e309
+ok 16 - independent rejects signed iat=-1e309
+  ---
+  duration_ms: 1.106501
+  type: 'test'
+  ...
+# Subtest: independent rejects token key locator x5c
+ok 17 - independent rejects token key locator x5c
+  ---
+  duration_ms: 0.924523
+  type: 'test'
+  ...
+# Subtest: independent rejects token key locator jku
+ok 18 - independent rejects token key locator jku
+  ---
+  duration_ms: 0.380531
+  type: 'test'
+  ...
+# Subtest: independent rejects token key locator jwk
+ok 19 - independent rejects token key locator jwk
+  ---
+  duration_ms: 0.423864
+  type: 'test'
+  ...
+# Subtest: independent rejects token key locator x5u
+ok 20 - independent rejects token key locator x5u
+  ---
+  duration_ms: 0.530662
+  type: 'test'
+  ...
+# Subtest: independent rejects JWKS too many keys
+ok 21 - independent rejects JWKS too many keys
+  ---
+  duration_ms: 0.837555
+  type: 'test'
+  ...
+# Subtest: independent rejects JWKS sign operation
+ok 22 - independent rejects JWKS sign operation
+  ---
+  duration_ms: 0.873137
+  type: 'test'
+  ...
+# Subtest: independent rejects JWKS duplicate verify operation
+ok 23 - independent rejects JWKS duplicate verify operation
+  ---
+  duration_ms: 0.616288
+  type: 'test'
+  ...
+# Subtest: independent rejects JWKS null operations
+ok 24 - independent rejects JWKS null operations
+  ---
+  duration_ms: 0.693182
+  type: 'test'
+  ...
+# Subtest: independent rejects JWKS non-array operations
+ok 25 - independent rejects JWKS non-array operations
+  ---
+  duration_ms: 0.567326
+  type: 'test'
+  ...
+# Subtest: independent rejects JWKS invalid point
+ok 26 - independent rejects JWKS invalid point
+  ---
+  duration_ms: 0.78022
+  type: 'test'
+  ...
+# Subtest: independent rejects malformed UTF-8 JWKS
+ok 27 - independent rejects malformed UTF-8 JWKS
+  ---
+  duration_ms: 1.589482
+  type: 'test'
+  ...
+# Subtest: independent enforces advertised length before reading
+ok 28 - independent enforces advertised length before reading
+  ---
+  duration_ms: 1.13387
+  type: 'test'
+  ...
+# Subtest: independent enforces streamed bytes without length header and cancels
+ok 29 - independent enforces streamed bytes without length header and cancels
+  ---
+  duration_ms: 3.037426
+  type: 'test'
+  ...
+# Subtest: independent aborts an unresponsive JWKS fetch at 3 seconds; concurrent callers share failure
+ok 30 - independent aborts an unresponsive JWKS fetch at 3 seconds; concurrent callers share failure
+  ---
+  duration_ms: 3002.955539
+  type: 'test'
+  ...
+# Subtest: independent timeout covers a stalled JWKS response body
+ok 31 - independent timeout covers a stalled JWKS response body
+  ---
+  duration_ms: 3004.818922
+  type: 'test'
+  ...
+# Subtest: independent cache remains usable after invalid signature without new fetch
+ok 32 - independent cache remains usable after invalid signature without new fetch
+  ---
+  duration_ms: 4.722269
+  type: 'test'
+  ...
+# Subtest: independent concurrent unknown kid refresh is deduplicated and validates rotated key
+ok 33 - independent concurrent unknown kid refresh is deduplicated and validates rotated key
+  ---
+  duration_ms: 14.517043
+  type: 'test'
+  ...
+# Subtest: independent failed refresh obeys cooldown, then recovers without stale acceptance
+ok 34 - independent failed refresh obeys cooldown, then recovers without stale acceptance
+  ---
+  duration_ms: 1.708809
+  type: 'test'
+  ...
+# Subtest: JWT maps only verified access claims and fetches the fixed public JWKS
+ok 35 - JWT maps only verified access claims and fetches the fixed public JWKS
+  ---
+  duration_ms: 20.519909
+  type: 'test'
+  ...
+# Subtest: JWT rejects wrong issuer
+ok 36 - JWT rejects wrong issuer
+  ---
+  duration_ms: 2.788569
+  type: 'test'
+  ...
+# Subtest: JWT rejects wrong audience
+ok 37 - JWT rejects wrong audience
+  ---
+  duration_ms: 4.471289
+  type: 'test'
+  ...
+# Subtest: JWT rejects multiple audiences
+ok 38 - JWT rejects multiple audiences
+  ---
+  duration_ms: 1.946078
+  type: 'test'
+  ...
+# Subtest: JWT rejects missing audience
+ok 39 - JWT rejects missing audience
+  ---
+  duration_ms: 1.912368
+  type: 'test'
+  ...
+# Subtest: JWT rejects missing subject
+ok 40 - JWT rejects missing subject
+  ---
+  duration_ms: 1.476145
+  type: 'test'
+  ...
+# Subtest: JWT rejects empty subject
+ok 41 - JWT rejects empty subject
+  ---
+  duration_ms: 1.631203
+  type: 'test'
+  ...
+# Subtest: JWT rejects non-string subject
+ok 42 - JWT rejects non-string subject
+  ---
+  duration_ms: 2.352992
+  type: 'test'
+  ...
+# Subtest: JWT rejects missing client
+ok 43 - JWT rejects missing client
+  ---
+  duration_ms: 2.126654
+  type: 'test'
+  ...
+# Subtest: JWT rejects empty client
+ok 44 - JWT rejects empty client
+  ---
+  duration_ms: 1.244834
+  type: 'test'
+  ...
+# Subtest: JWT rejects non-string client
+ok 45 - JWT rejects non-string client
+  ---
+  duration_ms: 0.968307
+  type: 'test'
+  ...
+# Subtest: JWT rejects expired
+ok 46 - JWT rejects expired
+  ---
+  duration_ms: 1.327236
+  type: 'test'
+  ...
+# Subtest: JWT rejects missing expiry
+ok 47 - JWT rejects missing expiry
+  ---
+  duration_ms: 1.377169
+  type: 'test'
+  ...
+# Subtest: JWT rejects string expiry
+ok 48 - JWT rejects string expiry
+  ---
+  duration_ms: 0.857523
+  type: 'test'
+  ...
+# Subtest: JWT rejects future issued-at
+ok 49 - JWT rejects future issued-at
+  ---
+  duration_ms: 1.025912
+  type: 'test'
+  ...
+# Subtest: JWT rejects missing issued-at
+ok 50 - JWT rejects missing issued-at
+  ---
+  duration_ms: 0.954467
+  type: 'test'
+  ...
+# Subtest: JWT rejects future nbf
+ok 51 - JWT rejects future nbf
+  ---
+  duration_ms: 0.869581
+  type: 'test'
+  ...
+# Subtest: JWT rejects too long lifetime
+ok 52 - JWT rejects too long lifetime
+  ---
+  duration_ms: 0.977431
+  type: 'test'
+  ...
+# Subtest: JWT rejects old issued-at
+ok 53 - JWT rejects old issued-at
+  ---
+  duration_ms: 0.815943
+  type: 'test'
+  ...
+# Subtest: JWT rejects reversed lifetime
+ok 54 - JWT rejects reversed lifetime
+  ---
+  duration_ms: 0.885976
+  type: 'test'
+  ...
+# Subtest: JWT rejects missing jti
+ok 55 - JWT rejects missing jti
+  ---
+  duration_ms: 0.818185
+  type: 'test'
+  ...
+# Subtest: JWT rejects empty jti
+ok 56 - JWT rejects empty jti
+  ---
+  duration_ms: 1.401856
+  type: 'test'
+  ...
+# Subtest: JWT rejects missing scope
+ok 57 - JWT rejects missing scope
+  ---
+  duration_ms: 0.740461
+  type: 'test'
+  ...
+# Subtest: JWT rejects array scope
+ok 58 - JWT rejects array scope
+  ---
+  duration_ms: 2.562055
+  type: 'test'
+  ...
+# Subtest: JWT rejects empty scope
+ok 59 - JWT rejects empty scope
+  ---
+  duration_ms: 0.782914
+  type: 'test'
+  ...
+# Subtest: JWT rejects duplicate scope
+ok 60 - JWT rejects duplicate scope
+  ---
+  duration_ms: 0.807209
+  type: 'test'
+  ...
+# Subtest: JWT rejects empty scope token
+ok 61 - JWT rejects empty scope token
+  ---
+  duration_ms: 1.045591
+  type: 'test'
+  ...
+# Subtest: JWT rejects control scope
+ok 62 - JWT rejects control scope
+  ---
+  duration_ms: 1.374216
+  type: 'test'
+  ...
+# Subtest: JWT rejects ID token shape
+ok 63 - JWT rejects ID token shape
+  ---
+  duration_ms: 1.521652
+  type: 'test'
+  ...
+# Subtest: JWT rejects internal BFF shape
+ok 64 - JWT rejects internal BFF shape
+  ---
+  duration_ms: 0.938072
+  type: 'test'
+  ...
+# Subtest: JWT rejects header missing kid
+ok 65 - JWT rejects header missing kid
+  ---
+  duration_ms: 0.607976
+  type: 'test'
+  ...
+# Subtest: JWT rejects header unknown kid
+ok 66 - JWT rejects header unknown kid
+  ---
+  duration_ms: 0.442081
+  type: 'test'
+  ...
+# Subtest: JWT rejects header untrusted jku
+ok 67 - JWT rejects header untrusted jku
+  ---
+  duration_ms: 0.323337
+  type: 'test'
+  ...
+# Subtest: JWT rejects header inline jwk
+ok 68 - JWT rejects header inline jwk
+  ---
+  duration_ms: 0.363385
+  type: 'test'
+  ...
+# Subtest: JWT rejects header x5u
+ok 69 - JWT rejects header x5u
+  ---
+  duration_ms: 0.508559
+  type: 'test'
+  ...
+# Subtest: JWT rejects invalid signature, unsupported alg and opaque token
+ok 70 - JWT rejects invalid signature, unsupported alg and opaque token
+  ---
+  duration_ms: 1.684211
+  type: 'test'
+  ...
+# Subtest: JWT rotation is bounded, refetches new kid after cooldown and drops removed key
+ok 71 - JWT rotation is bounded, refetches new kid after cooldown and drops removed key
+  ---
+  duration_ms: 2.030622
+  type: 'test'
+  ...
+# Subtest: JWT concurrent first requests share a single JWKS fetch
+ok 72 - JWT concurrent first requests share a single JWKS fetch
+  ---
+  duration_ms: 1.625195
+  type: 'test'
+  ...
+# Subtest: JWT JWKS rejects redirect and throttles failures
+ok 73 - JWT JWKS rejects redirect and throttles failures
+  ---
+  duration_ms: 0.843773
+  type: 'test'
+  ...
+# Subtest: JWT JWKS rejects network failure and throttles failures
+ok 74 - JWT JWKS rejects network failure and throttles failures
+  ---
+  duration_ms: 0.44149
+  type: 'test'
+  ...
+# Subtest: JWT JWKS rejects 500 and throttles failures
+ok 75 - JWT JWKS rejects 500 and throttles failures
+  ---
+  duration_ms: 0.53576
+  type: 'test'
+  ...
+# Subtest: JWT JWKS rejects wrong media and throttles failures
+ok 76 - JWT JWKS rejects wrong media and throttles failures
+  ---
+  duration_ms: 0.615047
+  type: 'test'
+  ...
+# Subtest: JWT JWKS rejects malformed JSON and throttles failures
+ok 77 - JWT JWKS rejects malformed JSON and throttles failures
+  ---
+  duration_ms: 0.601106
+  type: 'test'
+  ...
+# Subtest: JWT JWKS rejects oversized and throttles failures
+ok 78 - JWT JWKS rejects oversized and throttles failures
+  ---
+  duration_ms: 0.614425
+  type: 'test'
+  ...
+# Subtest: JWT JWKS rejects no keys and throttles failures
+ok 79 - JWT JWKS rejects no keys and throttles failures
+  ---
+  duration_ms: 0.443214
+  type: 'test'
+  ...
+# Subtest: JWT JWKS rejects duplicate kid and throttles failures
+ok 80 - JWT JWKS rejects duplicate kid and throttles failures
+  ---
+  duration_ms: 0.530021
+  type: 'test'
+  ...
+# Subtest: JWT JWKS rejects wrong curve and throttles failures
+ok 81 - JWT JWKS rejects wrong curve and throttles failures
+  ---
+  duration_ms: 0.525494
+  type: 'test'
+  ...
+# Subtest: JWT JWKS rejects private key material and throttles failures
+ok 82 - JWT JWKS rejects private key material and throttles failures
+  ---
+  duration_ms: 0.59666
+  type: 'test'
+  ...
+# Subtest: JWT JWKS rejects non-signing key and throttles failures
+ok 83 - JWT JWKS rejects non-signing key and throttles failures
+  ---
+  duration_ms: 0.480058
+  type: 'test'
+  ...
+# Subtest: JWT fails closed when cached keys expire and refresh fails
+ok 84 - JWT fails closed when cached keys expire and refresh fails
+  ---
+  duration_ms: 2.394559
+  type: 'test'
+  ...
+# Subtest: JWT rejects bad resource and oversized token before key fetch
+ok 85 - JWT rejects bad resource and oversized token before key fetch
+  ---
+  duration_ms: 1.22152
+  type: 'test'
+  ...
+# Subtest: auth uses exact trusted owner and scope
+ok 86 - auth uses exact trusted owner and scope
+  ---
+  duration_ms: 2.293019
+  type: 'test'
+  ...
+# Subtest: strict server-side allowlist and exact channel input
+ok 87 - strict server-side allowlist and exact channel input
+  ---
+  duration_ms: 1.561291
+  type: 'test'
+  ...
+# Subtest: rejects DM
+ok 88 - rejects DM
+  ---
+  duration_ms: 0.304058
+  type: 'test'
+  ...
+# Subtest: rejects thread
+ok 89 - rejects thread
+  ---
+  duration_ms: 0.161798
+  type: 'test'
+  ...
+# Subtest: rejects query
+ok 90 - rejects query
+  ---
+  duration_ms: 0.153867
+  type: 'test'
+  ...
+# Subtest: rejects fragment
+ok 91 - rejects fragment
+  ---
+  duration_ms: 0.159636
+  type: 'test'
+  ...
+# Subtest: rejects credential
+ok 92 - rejects credential
+  ---
+  duration_ms: 0.239142
+  type: 'test'
+  ...
+# Subtest: rejects trailing
+ok 93 - rejects trailing
+  ---
+  duration_ms: 0.136271
+  type: 'test'
+  ...
+# Subtest: rejects lookalike
+ok 94 - rejects lookalike
+  ---
+  duration_ms: 0.179725
+  type: 'test'
+  ...
+# Subtest: rejects http
+ok 95 - rejects http
+  ---
+  duration_ms: 0.307102
+  type: 'test'
+  ...
+# Subtest: rejects encode
+ok 96 - rejects encode
+  ---
+  duration_ms: 0.158173
+  type: 'test'
+  ...
+# Subtest: rejects other guild or channel
+ok 97 - rejects other guild or channel
+  ---
+  duration_ms: 0.278551
+  type: 'test'
+  ...
+# Subtest: cannot inject bot, sender, destination, authorization, URL or key
+ok 98 - cannot inject bot, sender, destination, authorization, URL or key
+  ---
+  duration_ms: 1.326184
+  type: 'test'
+  ...
+# Subtest: one bounded message, no mentions or control bytes
+ok 99 - one bounded message, no mentions or control bytes
+  ---
+  duration_ms: 0.819558
+  type: 'test'
+  ...
+# Subtest: dedup key remains same across destination/content changes, digest changes
+ok 100 - dedup key remains same across destination/content changes, digest changes
+  ---
+  duration_ms: 18.306001
+  type: 'test'
+  ...
+# Subtest: upstream URL/path, bot, body and secret are server controlled
+ok 101 - upstream URL/path, bot, body and secret are server controlled
+  ---
+  duration_ms: 4.283898
+  type: 'test'
+  ...
+# Subtest: preflight fail-closed without send enablement, secret, or binding
+ok 102 - preflight fail-closed without send enablement, secret, or binding
+  ---
+  duration_ms: 0.690188
+  type: 'test'
+  ...
+# Subtest: successful receipt persisted, retries and receipt queries never re-send
+ok 103 - successful receipt persisted, retries and receipt queries never re-send
+  ---
+  duration_ms: 7.536101
+  type: 'test'
+  ...
+# Subtest: changed content or allowed destination cannot bypass same-source dedup
+ok 104 - changed content or allowed destination cannot bypass same-source dedup
+  ---
+  duration_ms: 3.450415
+  type: 'test'
+  ...
+# Subtest: concurrent identical requests reserve once
+ok 105 - concurrent identical requests reserve once
+  ---
+  duration_ms: 6.097109
+  type: 'test'
+  ...
+# Subtest: network persists unknown and never auto-retries
+ok 106 - network persists unknown and never auto-retries
+  ---
+  duration_ms: 1.897116
+  type: 'test'
+  ...
+# Subtest: 429 persists unknown and never auto-retries
+ok 107 - 429 persists unknown and never auto-retries
+  ---
+  duration_ms: 1.527041
+  type: 'test'
+  ...
+# Subtest: 500 persists unknown and never auto-retries
+ok 108 - 500 persists unknown and never auto-retries
+  ---
+  duration_ms: 1.49965
+  type: 'test'
+  ...
+# Subtest: redirect persists unknown and never auto-retries
+ok 109 - redirect persists unknown and never auto-retries
+  ---
+  duration_ms: 5.223217
+  type: 'test'
+  ...
+# Subtest: malformed persists unknown and never auto-retries
+ok 110 - malformed persists unknown and never auto-retries
+  ---
+  duration_ms: 2.217288
+  type: 'test'
+  ...
+# Subtest: wrong channel persists unknown and never auto-retries
+ok 111 - wrong channel persists unknown and never auto-retries
+  ---
+  duration_ms: 1.793423
+  type: 'test'
+  ...
+# Subtest: numeric id persists unknown and never auto-retries
+ok 112 - numeric id persists unknown and never auto-retries
+  ---
+  duration_ms: 1.784439
+  type: 'test'
+  ...
+# Subtest: wrong bot persists unknown and never auto-retries
+ok 113 - wrong bot persists unknown and never auto-retries
+  ---
+  duration_ms: 1.798831
+  type: 'test'
+  ...
+# Subtest: oversized persists unknown and never auto-retries
+ok 114 - oversized persists unknown and never auto-retries
+  ---
+  duration_ms: 1.87333
+  type: 'test'
+  ...
+# Subtest: crash after durable reservation refuses retry across instance restart
+ok 115 - crash after durable reservation refuses retry across instance restart
+  ---
+  duration_ms: 1.35729
+  type: 'test'
+  ...
+# Subtest: failure to reserve does not send
+ok 116 - failure to reserve does not send
+  ---
+  duration_ms: 1.24824
+  type: 'test'
+  ...
+# Subtest: failure to persist successful receipt still blocks retry
+ok 117 - failure to persist successful receipt still blocks retry
+  ---
+  duration_ms: 1.593848
+  type: 'test'
+  ...
+# Subtest: read scope cannot send; outsider and disabled target cannot send
+ok 118 - read scope cannot send; outsider and disabled target cannot send
+  ---
+  duration_ms: 1.783328
+  type: 'test'
+  ...
+# Subtest: unknown receipt is read-only
+ok 119 - unknown receipt is read-only
+  ---
+  duration_ms: 1.029917
+  type: 'test'
+  ...
+1..119
+# tests 119
+# suites 0
+# pass 119
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 6235.190803

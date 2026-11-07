@@ -2,18 +2,9 @@
 //
 // A single Durable Object (class Gateway, SQLite-backed, one global
 // instance) keeps a persistent outbound WebSocket connection to the
-// Discord Gateway. Attachment is dual-mode (attachGatewaySocket()):
-// the preferred mode registers the socket with ctx.acceptWebSocket()
-// (WebSocket hibernation), so the object can sleep between events and
-// still be woken by Discord traffic, heartbeats and reconnect alarms;
-// when the runtime refuses that registration — a client socket from a
-// fetch Upgrade arrives already accepted on its pair and cannot be
-// re-accepted — the socket is instead held in an instance field with
-// inline addEventListener handlers feeding the same event processing.
-// The outbound socket itself is opened with fetch() and an Upgrade
-// header (the Workers client pattern — there is no usable
-// new WebSocket(url) client constructor, and fetch() refuses wss:
-// URLs, so openGatewaySocket() normalizes the scheme to https:).
+// Discord Gateway, using fetch Upgrade and standard client WebSocket events.
+// Outgoing sockets cannot hibernate, so connected objects incur duration
+// charges. SQLite state survives restarts and alarms reconnect/resume.
 //
 // Inbound: MESSAGE_CREATE events that are DMs to the bot, or that mention
 // the bot in a guild channel, are forwarded to the dots-events server as
@@ -191,7 +182,6 @@ export function buildForwardRequest(message, botUserId) {
   if (botUserId) {
     content = content
       .replace(new RegExp(`<@!?${botUserId}>`, "g"), "")
-      .replace(/[ \t]+/g, " ")
       .trim();
   } else {
     content = content.trim();
@@ -241,6 +231,7 @@ const DEFAULT_GATEWAY_STATE = Object.freeze({
   reconnectAttempts: 0,
   resumeMode: null, // "resume" | "identify" | null
   expectingClose: false,
+  reconnectBlocked: false,
   nextReconnectAt: null,
   nextHeartbeatAt: null,
   nextOutboxAt: null,
@@ -292,6 +283,7 @@ const BOOLEAN_STATE_KEYS = [
   "helloReceived",
   "awaitingHeartbeatAck",
   "expectingClose",
+  "reconnectBlocked",
 ];
 
 export function normalizeGatewayState(input) {
@@ -342,7 +334,9 @@ export function handleGatewayPayload(inputState, payload, opts = {}) {
       }
       state.helloReceived = true;
       state.awaitingHeartbeatAck = false;
-      state.nextHeartbeatAt = now + state.heartbeatIntervalMs;
+      const jitter = typeof opts.random === "function" ? opts.random() : Math.random();
+      state.nextHeartbeatAt = now + state.heartbeatIntervalMs * Math.max(0, Math.min(1, jitter));
+      state.nextWatchdogAt = now + 30000; // Identify/Resume must reach READY/RESUMED
       const canResume =
         state.resumeMode === "resume" &&
         typeof state.sessionId === "string" &&
@@ -366,9 +360,12 @@ export function handleGatewayPayload(inputState, payload, opts = {}) {
       // Reconnect: Discord asks us to close and resume on a new socket.
       state.ready = false;
       state.resumeMode = state.sessionId ? "resume" : "identify";
-      state.expectingClose = true;
+      state.connected = false;
+      state.helloReceived = false;
+      state.nextHeartbeatAt = null;
+      state.nextWatchdogAt = null;
       state.nextReconnectAt = now + 1000;
-      actions.push({ type: "close_socket", code: 1012 });
+      actions.push({ type: "close_socket", code: 4000 });
       actions.push({ type: "schedule_alarm" });
       break;
     }
@@ -379,7 +376,10 @@ export function handleGatewayPayload(inputState, payload, opts = {}) {
         typeof state.sessionId === "string" &&
         state.seq !== null;
       state.ready = false;
-      state.expectingClose = true;
+      state.connected = false;
+      state.helloReceived = false;
+      state.nextHeartbeatAt = null;
+      state.nextWatchdogAt = null;
       state.resumeMode = resumable ? "resume" : "identify";
       state.nextReconnectAt = now + (resumable ? 1000 : 3000);
       if (!resumable) {
@@ -388,7 +388,7 @@ export function handleGatewayPayload(inputState, payload, opts = {}) {
         state.seq = null;
       }
       state.lastError = "gateway invalid session";
-      actions.push({ type: "close_socket", code: 1012 });
+      actions.push({ type: "close_socket", code: 4000 });
       actions.push({ type: "schedule_alarm" });
       break;
     }
@@ -411,6 +411,7 @@ export function handleGatewayPayload(inputState, payload, opts = {}) {
         state.connected = true;
         state.reconnectAttempts = 0;
         state.resumeMode = "resume";
+        state.nextWatchdogAt = null;
         state.lastReadyAt = now;
         state.lastError = null;
       } else if (payload.t === "RESUMED") {
@@ -418,6 +419,7 @@ export function handleGatewayPayload(inputState, payload, opts = {}) {
         state.connected = true;
         state.reconnectAttempts = 0;
         state.resumeMode = "resume";
+        state.nextWatchdogAt = null;
         state.lastReadyAt = now;
         state.lastError = null;
       } else if (payload.t === "MESSAGE_CREATE") {
@@ -481,7 +483,7 @@ export function eventSilenceDecision(
   return { action: "reconnect", reason: "dispatch_silence" };
 }
 
-const FATAL_CLOSE_CODES = new Set([4004, 4010, 4012, 4013, 4014]);
+const FATAL_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 const SESSION_INVALID_CLOSE_CODES = new Set([4007, 4009]);
 
 // Decide reconnect timing / session handling after the socket closes.
@@ -496,6 +498,8 @@ export function reconnectDecisionForClose(inputState, code, now = Date.now()) {
   state.awaitingHeartbeatAck = false;
   state.expectingClose = false;
   state.nextHeartbeatAt = null;
+  state.nextWatchdogAt = null;
+  state.reconnectBlocked = fatal;
   if (clearSession) {
     state.sessionId = null;
     state.resumeGatewayUrl = null;
@@ -513,11 +517,11 @@ export function reconnectDecisionForClose(inputState, code, now = Date.now()) {
   }
   state.reconnectAttempts = (state.reconnectAttempts || 0) + 1;
   const delayMs = fatal
-    ? 300000
+    ? null
     : sessionInvalid
       ? 1000
       : Math.min(60000, 1000 * 2 ** (state.reconnectAttempts - 1));
-  state.nextReconnectAt = now + delayMs;
+  state.nextReconnectAt = fatal ? null : now + delayMs;
   return { state, delayMs, clearSession };
 }
 
@@ -541,65 +545,32 @@ function withGatewayParams(rawUrl) {
   return url.toString();
 }
 
-// Open the outbound gateway socket and return it. Workers has no
-// usable `new WebSocket(url)` client constructor; the supported
-// client pattern is an HTTP Upgrade handshake through fetch(), whose
-// response carries the socket as `response.webSocket` on a 101.
-// fetch() also refuses wss: URLs outright ("Fetch API cannot load"),
-// so the scheme is normalized (wss: -> https:, ws: -> http:) — the
-// gateway endpoint is an HTTPS endpoint that upgrades. The fetch
-// implementation is a parameter so tests can inject fake upgrade
-// responses. The caller (inside the Durable Object) attaches the
-// returned socket via attachGatewaySocket() below.
+// Acquire a client socket using the Workers HTTP Upgrade API. Outbound
+// sockets cannot be registered with the server-only hibernation API.
 export async function openGatewaySocket(fetchImpl, url) {
-  const upgradeUrl = String(url)
-    .replace(/^wss:/i, "https:")
-    .replace(/^ws:/i, "http:");
+  const upgradeUrl = String(url).replace(/^wss:/i, "https:").replace(/^ws:/i, "http:");
   const res = await fetchImpl(upgradeUrl, {
     headers: { Upgrade: "websocket" },
+    redirect: "manual",
+    signal: AbortSignal.timeout(10000),
   });
-  const ws = res ? res.webSocket : null;
-  if (!ws) {
-    throw new Error(
-      "gateway upgrade failed: HTTP " + (res ? res.status : "no response")
-    );
+  const ws = res?.webSocket;
+  if (!ws || res.status !== 101) {
+    await res?.body?.cancel();
+    throw new Error("gateway upgrade failed: HTTP " + (res ? res.status : "no response"));
   }
   return ws;
 }
 
-// Attach an opened gateway socket to the Durable Object and return
-// the attachment mode: "hibernation" or "inline".
-//
-// Preferred: ctx.acceptWebSocket() (WebSocket hibernation) — the
-// runtime then delivers message/close/error events through the DO's
-// webSocketMessage/webSocketClose/webSocketError callbacks and can
-// sleep the object between events. But a client socket obtained from
-// a fetch Upgrade is already accepted on its pair in the current
-// runtime, and re-registering it throws ("Cannot call
-// `acceptWebSocket()` on this WebSocket because its pair has already
-// been accepted or used in a Response" — observed live on v0.3.0).
-// In that case fall back to inline addEventListener handlers that
-// funnel into the exact same processing; the caller keeps the socket
-// in an instance field so the object can find and close it. ctx and
-// the handlers are parameters so tests can drive both modes with
-// fakes.
-export function attachGatewaySocket({ ctx, ws, handlers }) {
-  try {
-    ctx.acceptWebSocket(ws, ["discord"]);
-    return "hibernation";
-  } catch (_) {
-    /* registration refused (see above): attach inline instead */
+// Keep the attachment helper shared by runtime callers and tests. Install
+// listeners before accept() releases frames queued during the handshake.
+export function attachGatewaySocket({ ws, handlers }) {
+  ws.addEventListener("message", event => handlers.onMessage(event.data));
+  ws.addEventListener("close", event => handlers.onClose(event.code, event.reason, event.wasClean));
+  ws.addEventListener("error", event => handlers.onError(event));
+  try { ws.accept(); } catch (error) {
+    if (ws.readyState !== 1) throw error; // tolerate only an already-open client
   }
-  try {
-    if (ws && typeof ws.accept === "function") ws.accept();
-  } catch (_) {
-    /* already accepted on its pair; the listeners below still work */
-  }
-  ws.addEventListener("message", (event) => handlers.onMessage(event.data));
-  ws.addEventListener("close", (event) =>
-    handlers.onClose(event.code, event.reason, event.wasClean)
-  );
-  ws.addEventListener("error", (event) => handlers.onError(event));
   return "inline";
 }
 
@@ -616,15 +587,9 @@ export class Gateway extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this._lock = Promise.resolve();
-    // The currently attached gateway socket and how it is attached
-    // ("hibernation" | "inline" | null). In hibernation mode the
-    // runtime also tracks the socket (ctx.getWebSockets); after a
-    // hibernation wake these fields reset and the runtime registry is
-    // the source of truth. In inline mode this field is the ONLY
-    // handle on the socket, so it is what getGatewaySocket() consults
-    // first and what the close/error handlers clear.
     this._socket = null;
     this._socketMode = null;
+    this._flushPromise = null;
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     );
@@ -644,7 +609,7 @@ export class Gateway extends DurableObject {
     );
     // Self-start: if configured and no alarm is pending, arrange a
     // watchdog wake-up so a configured-but-disconnected object reconnects
-    // on its own (e.g. after a deploy or a hibernation with no alarm).
+    // on its own (e.g. after a deploy or object restart with no alarm).
     try {
       this.ctx.blockConcurrencyWhile(async () => {
         const existing = await this.ctx.storage.getAlarm();
@@ -695,22 +660,22 @@ export class Gateway extends DurableObject {
   }
 
   getGatewaySocket() {
-    if (this._socket) {
-      const rs = this._socket.readyState;
-      if (rs === 0 || rs === 1) return this._socket; // CONNECTING or OPEN
+    const ws = this._socket;
+    return ws && (ws.readyState === 0 || ws.readyState === 1) ? ws : null;
+  }
+
+  closeGatewaySocket(ws, reason) {
+    if (this._socket === ws) {
+      this._socket = null;
+      this._socketMode = null;
     }
-    const sockets = this.ctx.getWebSockets("discord");
-    for (let i = sockets.length - 1; i >= 0; i--) {
-      const rs = sockets[i].readyState;
-      if (rs === 0 || rs === 1) return sockets[i]; // CONNECTING or OPEN
-    }
-    return null;
+    try { ws.close(4000, reason); } catch (_) { /* already closed */ }
   }
 
   statusSnapshot() {
     const state = this.loadState();
     const socket = this.getGatewaySocket();
-    const connected = Boolean(socket);
+    const connected = socket?.readyState === 1;
     return { connected, ready: connected && state.ready };
   }
 
@@ -733,15 +698,18 @@ export class Gateway extends DurableObject {
   async scheduleAlarmLocked(state) {
     const now = Date.now();
     const candidates = [];
-    if (state.nextOutboxAt) candidates.push(state.nextOutboxAt);
-    if (state.nextReconnectAt) candidates.push(state.nextReconnectAt);
+    if (state.nextOutboxAt && !this._flushPromise) candidates.push(state.nextOutboxAt);
+    if (!state.reconnectBlocked && state.nextReconnectAt) candidates.push(state.nextReconnectAt);
     if (state.nextHeartbeatAt) candidates.push(state.nextHeartbeatAt);
     if (state.nextWatchdogAt) candidates.push(state.nextWatchdogAt);
     if (state.ready && state.lastDispatchAt) {
       candidates.push(state.lastDispatchAt + MAX_EVENT_SILENCE_MS);
     }
-    if (this.isConfigured()) candidates.push(now + 60000); // watchdog
-    if (!candidates.length) return;
+    if (this.isConfigured() && !state.reconnectBlocked) candidates.push(now + 60000); // watchdog
+    if (!candidates.length) {
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
     const at = Math.max(now + 250, Math.min(...candidates));
     const existing = await this.ctx.storage.getAlarm();
     if (existing !== null && existing <= at) return;
@@ -757,7 +725,7 @@ export class Gateway extends DurableObject {
     }
     if (url.pathname === "/internal/connect" && request.method === "POST") {
       return this.runLocked(async () => {
-        await this.connectLocked();
+        await this.connectLocked({ manual: true });
         return jsonResponse(this.diagnosticsSnapshot());
       });
     }
@@ -779,6 +747,7 @@ export class Gateway extends DurableObject {
       const res = await fetch(`${DISCORD_API_BASE}/gateway/bot`, {
         headers: { Authorization: `Bot ${this.env.DISCORD_BOT_TOKEN}` },
         redirect: "manual",
+        signal: AbortSignal.timeout(10000),
       });
       if (res.ok) {
         const j = await res.json().catch(() => null);
@@ -795,8 +764,10 @@ export class Gateway extends DurableObject {
     return withGatewayParams(base);
   }
 
-  async connectLocked() {
+  async connectLocked({ manual = false } = {}) {
     let state = this.loadState();
+    if (manual) state.reconnectBlocked = false;
+    if (state.reconnectBlocked) return this.statusSnapshot();
     state.configured = this.isConfigured();
     if (!state.configured) {
       state.connected = false;
@@ -812,51 +783,35 @@ export class Gateway extends DurableObject {
       await this.scheduleAlarmLocked(state);
       return this.statusSnapshot();
     }
-    // Drop any stale (closed/closing) sockets before dialing: the
-    // inline-held one (if it is not the live socket found above) and
-    // any hibernation-registered ones.
-    if (this._socket) {
-      try {
-        this._socket.close(1000, "replaced");
-      } catch (_) {
-        /* already gone */
-      }
-      this._socket = null;
-      this._socketMode = null;
-    }
-    for (const ws of this.ctx.getWebSockets("discord")) {
-      try {
-        ws.close(1000, "replaced");
-      } catch (_) {
-        /* already gone */
-      }
-    }
+    if (this._socket) this.closeGatewaySocket(this._socket, "replaced");
     state.lastConnectAttemptAt = Date.now();
     state.reconnectAttempts = (state.reconnectAttempts || 0) + 1;
     const url = await this.gatewayUrlForConnect(state);
     try {
       const ws = await openGatewaySocket(fetch, url);
+      this._socket = ws;
       this._socketMode = attachGatewaySocket({
         ctx: this.ctx,
         ws,
         handlers: {
-          onMessage: (data) => this.handleSocketMessage(ws, data),
+          onMessage: (data) => this.ctx.waitUntil(this.handleSocketMessage(ws, data)),
           onClose: (code, reason, wasClean) =>
-            this.handleSocketClose(ws, code, reason, wasClean),
-          onError: (error) => this.handleSocketError(ws, error),
+            this.ctx.waitUntil(this.handleSocketClose(ws, code, reason, wasClean)),
+          onError: (error) => this.ctx.waitUntil(this.handleSocketError(ws, error)),
         },
       });
-      this._socket = ws;
       state.connected = true;
       state.ready = false;
       state.helloReceived = false;
       state.awaitingHeartbeatAck = false;
+      state.expectingClose = false;
       state.socketOpenedAt = Date.now();
       state.nextHeartbeatAt = null;
       state.nextReconnectAt = null;
       state.nextWatchdogAt = Date.now() + 30000; // hello timeout watchdog
       state.lastError = null;
     } catch (e) {
+      if (this._socket) this.closeGatewaySocket(this._socket, "connection failed");
       state.connected = false;
       state.ready = false;
       state.lastError = `gateway connect failed: ${String(e).slice(0, 120)}`;
@@ -873,10 +828,8 @@ export class Gateway extends DurableObject {
 
   // --- gateway event handling ---
   //
-  // The runtime callbacks (hibernation mode) delegate to the internal
-  // handleSocket* methods; the inline listeners installed by
-  // attachGatewaySocket() call the same methods, so both attachment
-  // modes share one processing path.
+  // Keep callback aliases for callers while standard listeners feed
+  // the same internal handleSocket* processing path.
 
   async webSocketMessage(ws, message) {
     return this.handleSocketMessage(ws, message);
@@ -884,6 +837,7 @@ export class Gateway extends DurableObject {
 
   async handleSocketMessage(ws, message) {
     await this.runLocked(async () => {
+      if (ws !== this._socket) return; // ignore a replaced connection
       let payload;
       try {
         const text =
@@ -898,7 +852,7 @@ export class Gateway extends DurableObject {
       const { state: nextState, actions } = handleGatewayPayload(state, payload, {
         now: Date.now(),
       });
-      nextState.connected = true;
+      if (!actions.some(action => action.type === "close_socket")) nextState.connected = true;
       this.saveState(nextState);
       await this.executeGatewayActions(ws, nextState, actions);
       const current = this.loadState();
@@ -942,11 +896,7 @@ export class Gateway extends DurableObject {
       } else if (action.type === "forward") {
         await this.enqueueForward(action.request);
       } else if (action.type === "close_socket") {
-        try {
-          ws.close(action.code || 1012, "reconnecting");
-        } catch (_) {
-          /* already closed */
-        }
+        this.closeGatewaySocket(ws, "reconnecting");
       }
       // "schedule_alarm" is handled by the caller after all actions.
     }
@@ -957,11 +907,10 @@ export class Gateway extends DurableObject {
   }
 
   async handleSocketClose(ws, code, reason, wasClean) {
-    if (this._socket === ws) {
+    await this.runLocked(async () => {
+      if (ws !== this._socket) return;
       this._socket = null;
       this._socketMode = null;
-    }
-    await this.runLocked(async () => {
       const state = this.loadState();
       state.connected = false;
       state.ready = false;
@@ -997,11 +946,9 @@ export class Gateway extends DurableObject {
   }
 
   async handleSocketError(ws, error) {
-    if (this._socket === ws) {
-      this._socket = null;
-      this._socketMode = null;
-    }
     await this.runLocked(async () => {
+      if (ws !== this._socket) return;
+      this.closeGatewaySocket(ws, "socket error");
       const state = this.loadState();
       state.connected = false;
       state.ready = false;
@@ -1027,39 +974,31 @@ export class Gateway extends DurableObject {
       state.lastAlarmAt = now;
       this.saveState(state);
 
-      if (state.nextOutboxAt && state.nextOutboxAt <= now) {
-        await this.flushOutbox();
-        state = this.loadState();
-      }
-
       const socket = this.getGatewaySocket();
       if (!socket) {
         state.connected = false;
         state.ready = false;
         this.saveState(state);
         if (
-          this.isConfigured() &&
+          this.isConfigured() && !state.reconnectBlocked &&
           (state.nextReconnectAt === null || state.nextReconnectAt <= Date.now())
         ) {
           await this.connectLocked();
         }
       } else if (
-        !state.helloReceived &&
-        state.socketOpenedAt &&
-        now - state.socketOpenedAt > 30000
+        !state.ready && state.nextWatchdogAt && now >= state.nextWatchdogAt
       ) {
-        // Socket opened but Discord never said Hello: treat as dead.
+        // Hello/Identify/Resume did not complete in time: treat as dead.
         state.resumeMode = state.sessionId ? "resume" : "identify";
-        state.expectingClose = true;
+        state.helloReceived = false;
+        state.nextHeartbeatAt = null;
+        state.nextWatchdogAt = null;
         state.nextReconnectAt = now + 1000;
         state.connected = false;
         state.ready = false;
+        state.lastError = "gateway handshake timeout";
         this.saveState(state);
-        try {
-          socket.close(1012, "hello timeout");
-        } catch (_) {
-          /* already closed */
-        }
+        this.closeGatewaySocket(socket, "handshake timeout");
       } else if (
         state.helloReceived &&
         eventSilenceDecision(state, now).action === "reconnect"
@@ -1068,17 +1007,15 @@ export class Gateway extends DurableObject {
         // the socket is deaf. Close and resume (Hermes' liveness probe
         // does the equivalent against discord.py).
         state.resumeMode = state.sessionId ? "resume" : "identify";
-        state.expectingClose = true;
+        state.helloReceived = false;
+        state.nextHeartbeatAt = null;
+        state.nextWatchdogAt = null;
         state.nextReconnectAt = now + 1000;
         state.connected = false;
         state.ready = false;
         state.lastError = "gateway dispatch silence: forcing reconnect";
         this.saveState(state);
-        try {
-          socket.close(1012, "dispatch silence");
-        } catch (_) {
-          /* already closed */
-        }
+        this.closeGatewaySocket(socket, "dispatch silence");
       } else if (
         state.helloReceived &&
         state.nextHeartbeatAt &&
@@ -1088,15 +1025,13 @@ export class Gateway extends DurableObject {
         if (decision.action === "reconnect") {
           const next = decision.state;
           next.resumeMode = next.sessionId ? "resume" : "identify";
-          next.expectingClose = true;
+          next.helloReceived = false;
+          next.nextHeartbeatAt = null;
+          next.nextWatchdogAt = null;
           next.nextReconnectAt = now + 1000;
           next.connected = false;
           this.saveState(next);
-          try {
-            socket.close(1012, "heartbeat ack timeout");
-          } catch (_) {
-            /* already closed */
-          }
+          this.closeGatewaySocket(socket, "heartbeat ack timeout");
         } else if (decision.action === "send_heartbeat") {
           const next = decision.state;
           try {
@@ -1111,6 +1046,9 @@ export class Gateway extends DurableObject {
       const current = this.loadState();
       await this.scheduleAlarmLocked(current);
     });
+    // Network delivery must never hold the protocol lock: a slow webhook
+    // must not prevent heartbeat ACKs, reconnects, or status requests.
+    this.ctx.waitUntil(this.flushOutbox());
   }
 
   // --- forwarding outbox (SQLite) ---
@@ -1150,102 +1088,98 @@ export class Gateway extends DurableObject {
     const state = this.loadState();
     state.nextOutboxAt = Date.now();
     this.saveState(state);
-    await this.flushOutbox();
+    // The caller arms an immediate alarm after persisting this row.
   }
 
   // POST due outbox rows to dots-events' /claude-hook with a fresh
   // Standard Webhooks signature per attempt. The receiver deduplicates
   // by the body's request_id, so retries never file a request twice.
   async flushOutbox() {
-    let state = this.loadState();
+    if (this._flushPromise) return this._flushPromise;
+    this._flushPromise = this.deliverOutbox().finally(async () => {
+      this._flushPromise = null;
+      await this.runLocked(() => this.scheduleAlarmLocked(this.loadState()));
+    });
+    return this._flushPromise;
+  }
+
+  async deliverOutbox() {
     const secret = this.env.CLAUDE_HOOK_SECRET;
     if (!secret) {
-      state.lastForwardError = "missing CLAUDE_HOOK_SECRET";
-      state.nextOutboxAt = null;
-      this.saveState(state);
+      await this.runLocked(() => {
+        const state = this.loadState();
+        state.lastForwardError = "missing CLAUDE_HOOK_SECRET";
+        state.nextOutboxAt = null;
+        this.saveState(state);
+      });
       return;
     }
-    const now = Date.now();
-    const rows = this.ctx.storage.sql
-      .exec(
-        "SELECT request_id, body, attempts FROM outbox " +
-          "WHERE next_attempt_at <= ? ORDER BY created_at ASC LIMIT 10",
-        now
-      )
-      .toArray();
+    const rows = await this.runLocked(() => this.ctx.storage.sql.exec(
+      "SELECT request_id, body, attempts FROM outbox " +
+      "WHERE next_attempt_at <= ? ORDER BY created_at ASC LIMIT 10", Date.now()
+    ).toArray());
     for (const row of rows) {
       const attempts = row.attempts + 1;
       let ok = false;
-      let rateLimitDelayMs = null;
+      let delayMs = Math.min(60000, 1000 * 2 ** attempts);
+      let error = null;
       try {
-        const parsed = JSON.parse(row.body);
         const ts = String(Math.floor(Date.now() / 1000));
-        const signature = await signBody(secret, parsed.request_id, ts, row.body);
+        const signature = await signBody(secret, row.request_id, ts, row.body);
         const res = await fetch(CLAUDE_HOOK_URL, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "webhook-id": parsed.request_id,
+            "webhook-id": row.request_id,
             "webhook-timestamp": ts,
             "webhook-signature": signature,
           },
           body: row.body,
           redirect: "manual",
+          signal: AbortSignal.timeout(10000),
         });
         ok = res.ok;
         if (!ok) {
-          state.lastForwardError = `claude-hook HTTP ${res.status} for ${row.request_id}`;
+          error = `claude-hook HTTP ${res.status} for ${row.request_id}`;
           if (res.status === 429) {
-            // Honor the receiver's rate limit instead of the generic
-            // backoff (same retry_after discipline as /send).
             const seconds = parseRetryAfterSeconds({ headers: res.headers });
-            if (seconds !== null) {
-              rateLimitDelayMs = Math.min(300000, Math.ceil(seconds * 1000));
-            }
+            if (seconds !== null) delayMs = Math.max(delayMs, Math.ceil(seconds * 1000));
           }
         }
-      } catch (e) {
-        state.lastForwardError = `claude-hook failed for ${row.request_id}: ${String(e).slice(0, 120)}`;
+        await res.body?.cancel();
+      } catch (_) {
+        error = `claude-hook request failed for ${row.request_id}`;
       }
-      if (ok) {
+      await this.runLocked(async () => {
+        // Reload after I/O so concurrent ACK/session changes are never overwritten.
+        const state = this.loadState();
+        state.lastForwardError = error;
+        if (ok || attempts >= MAX_FORWARD_ATTEMPTS) {
+          this.ctx.storage.sql.exec("DELETE FROM outbox WHERE request_id = ?", row.request_id);
+          if (ok) {
+            this.ctx.storage.sql.exec(
+              "INSERT OR REPLACE INTO forward_log (request_id, completed_at) VALUES (?, ?)",
+              row.request_id, Date.now()
+            );
+            state.forwardedCount += 1;
+            state.lastForwardAt = Date.now();
+          } else state.droppedForwardCount += 1;
+        } else {
+          this.ctx.storage.sql.exec(
+            "UPDATE outbox SET attempts = ?, next_attempt_at = ? WHERE request_id = ?",
+            attempts, Date.now() + delayMs, row.request_id
+          );
+        }
         this.ctx.storage.sql.exec(
-          "DELETE FROM outbox WHERE request_id = ?",
-          row.request_id
+          "DELETE FROM forward_log WHERE completed_at < ?", Date.now() - 7 * 24 * 60 * 60 * 1000
         );
-        this.ctx.storage.sql.exec(
-          "INSERT OR REPLACE INTO forward_log (request_id, completed_at) VALUES (?, ?)",
-          row.request_id,
-          Date.now()
-        );
-        state.forwardedCount = (state.forwardedCount || 0) + 1;
-        state.lastForwardAt = Date.now();
-        state.lastForwardError = null;
-      } else if (attempts >= MAX_FORWARD_ATTEMPTS) {
-        this.ctx.storage.sql.exec(
-          "DELETE FROM outbox WHERE request_id = ?",
-          row.request_id
-        );
-        state.droppedForwardCount = (state.droppedForwardCount || 0) + 1;
-      } else {
-        const backoff = Math.min(60000, 1000 * 2 ** attempts);
-        const delay = Math.max(backoff, rateLimitDelayMs ?? 0);
-        this.ctx.storage.sql.exec(
-          "UPDATE outbox SET attempts = ?, next_attempt_at = ? WHERE request_id = ?",
-          attempts,
-          Date.now() + delay,
-          row.request_id
-        );
-      }
+        state.nextOutboxAt = this.earliestOutboxAt();
+        this.saveState(state);
+        await this.scheduleAlarmLocked(state);
+      });
     }
-    // Prune the replay-dedup log weekly; a week far exceeds Discord's
-    // resume replay window.
-    this.ctx.storage.sql.exec(
-      "DELETE FROM forward_log WHERE completed_at < ?",
-      Date.now() - 7 * 24 * 60 * 60 * 1000
-    );
-    state.nextOutboxAt = this.earliestOutboxAt();
-    this.saveState(state);
   }
+
 }
 
 // ---------- outbound send helpers (pure) ----------
@@ -1286,7 +1220,9 @@ export function splitDiscordContent(
   }
   const roughDropped = rest.length - limit;
   const notice = `\n…(truncated: ${roughDropped} more characters not sent)`;
-  const kept = rest.slice(0, limit - notice.length);
+  let cut = limit - notice.length;
+  if (rest.charCodeAt(cut - 1) >= 0xd800 && rest.charCodeAt(cut - 1) <= 0xdbff) cut--;
+  const kept = rest.slice(0, cut);
   const dropped = rest.length - kept.length;
   let last = kept + `\n…(truncated: ${dropped} more characters not sent)`;
   if (last.length > limit) last = last.slice(0, limit);
@@ -1554,7 +1490,7 @@ async function handleSend(env, request) {
             Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ content: chunks[i] }),
+          body: JSON.stringify({ content: chunks[i], allowed_mentions: { parse: [] } }),
           redirect: "manual",
         }
       );
@@ -1570,10 +1506,9 @@ async function handleSend(env, request) {
         body: parsed,
         headers: res.headers,
       });
-      const waitMs = Math.min(
-        MAX_RATE_LIMIT_WAIT_MS,
-        Math.max(250, Math.ceil((seconds ?? 1) * 1000))
-      );
+      // A long rate limit is returned to the caller, never retried early.
+      if (seconds !== null && seconds * 1000 > MAX_RATE_LIMIT_WAIT_MS) break;
+      const waitMs = Math.max(250, Math.ceil((seconds ?? 1) * 1000));
       await sleepMs(waitMs);
     }
     if (!res.ok) {

@@ -6,15 +6,9 @@
 // - HTTP behavior (admin auth on /send, /status shape, Discord REST
 //   pass-through with content truncation) runs on Miniflare with a
 //   mocked outbound service, fully locally.
-// The real Discord Gateway socket lifecycle is NOT exercised here:
-// Miniflare cannot stand in for Discord's gateway, so the op-code
-// handling is covered at the pure-function level instead (see
-// handleGatewayPayload / heartbeatDecision / reconnectDecisionForClose),
-// and socket acquisition/attachment at the helper level
-// (openGatewaySocket / attachGatewaySocket with fakes: a Node-side
-// outbound mock cannot mint a WebSocket, and whether the live runtime
-// accepts hibernation registration for a client socket is only
-// observable in production).
+// The real Discord service is never contacted. lifecycle.test.mjs covers
+// actual workerd client sockets against a separate local mock worker;
+// this file covers pure helpers and HTTP calls with Node-side mocks.
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -164,7 +158,7 @@ test("protocol: Hello on a fresh session decides Identify and arms the heartbeat
     ["identify", "schedule_alarm"]
   );
   assert.equal(state.heartbeatIntervalMs, 41250);
-  assert.equal(state.nextHeartbeatAt, NOW + 41250);
+  assert.ok(state.nextHeartbeatAt >= NOW && state.nextHeartbeatAt <= NOW + 41250);
   assert.equal(state.helloReceived, true);
 });
 
@@ -244,7 +238,8 @@ test("protocol: Reconnect (op 7) closes the socket and schedules a resume", () =
   const start = { ...DS, sessionId: "sess-1", ready: true };
   const { state, actions } = pure.handleGatewayPayload(start, { op: 7 }, { now: NOW });
   assert.equal(state.resumeMode, "resume");
-  assert.equal(state.expectingClose, true);
+  assert.equal(state.connected, false);
+  assert.equal(state.nextHeartbeatAt, null);
   assert.equal(state.nextReconnectAt, NOW + 1000);
   assert.ok(actions.some((a) => a.type === "close_socket"));
 });
@@ -291,7 +286,7 @@ test("heartbeat decision: a missed ACK means reconnect; otherwise send and re-ar
   assert.equal(sent.state.nextHeartbeatAt, NOW + 1000);
 });
 
-test("close decision: fatal codes clear the session with a long backoff", () => {
+test("close decision: fatal codes clear the session and stop automatic reconnect", () => {
   const start = {
     ...DS,
     sessionId: "sess-1",
@@ -301,7 +296,9 @@ test("close decision: fatal codes clear the session with a long backoff", () => 
   const fatal = pure.reconnectDecisionForClose(start, 4004, NOW);
   assert.equal(fatal.clearSession, true);
   assert.equal(fatal.state.sessionId, null);
-  assert.equal(fatal.delayMs, 300000);
+  assert.equal(fatal.delayMs, null);
+  assert.equal(fatal.state.nextReconnectAt, null);
+  assert.equal(fatal.state.reconnectBlocked, true);
 
   const invalidSeq = pure.reconnectDecisionForClose(start, 4007, NOW);
   assert.equal(invalidSeq.clearSession, true);
@@ -400,6 +397,8 @@ let lastDiscordSend = null;
 let avatarPatch = null;
 const RATE_LIMIT_CHANNEL = "999888777666555444";
 let rateLimitHits = 0;
+let longRateLimitHits = 0;
+const LONG_RATE_LIMIT_CHANNEL = "999888777666555445";
 // 1x1 transparent PNG, used by the /avatar tests.
 const PNG_1PX_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAwMCAO+ip1sAAAAASUVORK5CYII=";
@@ -436,6 +435,10 @@ async function outboundService(req) {
     };
     discordSends.push(record);
     lastDiscordSend = record;
+    if(req.url.includes(LONG_RATE_LIMIT_CHANNEL)) {
+      longRateLimitHits++;
+      return Response.json({retry_after:60}, {status:429,headers:{'Retry-After':'60'}});
+    }
     // Scripted rate limit: the first send to this channel gets a 429
     // with a tiny retry_after, later sends succeed.
     if (req.url.includes(RATE_LIMIT_CHANNEL) && rateLimitHits === 0) {
@@ -657,33 +660,27 @@ test("pure: openGatewaySocket throws with the HTTP status when the upgrade fails
 
 // ---------- gateway socket attachment (pure, fakes) ----------
 
-test("pure: attachGatewaySocket prefers hibernation registration", () => {
-  const accepted = [];
-  const ctx = {
-    acceptWebSocket: (ws, tags) => {
-      accepted.push([ws, tags]);
-    },
-  };
+test("pure: attachGatewaySocket uses standard listeners, never hibernation registration", () => {
   const listeners = {};
+  let acceptCalls = 0;
   const ws = {
-    addEventListener: (type, fn) => {
-      listeners[type] = fn;
+    readyState: 0,
+    addEventListener: (type, fn) => { listeners[type] = fn; },
+    accept: () => {
+      assert.deepEqual(Object.keys(listeners).sort(), ['close', 'error', 'message']);
+      acceptCalls++;
+      ws.readyState = 1;
     },
   };
   const mode = pure.attachGatewaySocket({
-    ctx,
-    ws,
-    handlers: { onMessage() {}, onClose() {}, onError() {} },
+    ctx: {acceptWebSocket() { assert.fail('outgoing sockets must not hibernate'); }},
+    ws, handlers: {onMessage() {}, onClose() {}, onError() {}},
   });
-  assert.equal(mode, "hibernation");
-  assert.equal(accepted.length, 1);
-  assert.equal(accepted[0][0], ws);
-  assert.deepEqual(accepted[0][1], ["discord"]);
-  // Hibernation mode attaches no inline listeners at all.
-  assert.deepEqual(Object.keys(listeners), []);
+  assert.equal(mode, 'inline');
+  assert.equal(acceptCalls, 1);
 });
 
-test("pure: attachGatewaySocket falls back to inline listeners when registration throws", () => {
+test("pure: attachGatewaySocket tolerates an already-open client and forwards events", () => {
   const ctx = {
     acceptWebSocket: () => {
       throw new Error(
@@ -695,6 +692,7 @@ test("pure: attachGatewaySocket falls back to inline listeners when registration
   const listeners = { message: [], close: [], error: [] };
   let acceptCalls = 0;
   const ws = {
+    readyState: 1,
     // A fetch-upgrade client socket may also refuse accept(); the
     // helper must ignore that and still wire the listeners.
     accept: () => {
@@ -819,4 +817,69 @@ test("http: /avatar fetches image_url and sets the avatar", async () => {
     avatarPatch.body.avatar,
     "data:image/png;base64," + PNG_1PX_B64
   );
+});
+
+test('filter: forwarded code preserves indentation and internal tabs', () => {
+  const code = 'if True:\n    if True:\n        print("hello")\n\t# tab retained';
+  const req = pure.buildForwardRequest(message({guild_id:undefined,content:code}), BOT_ID);
+  assert.equal(req.text.split('\n').slice(1).join('\n'),code);
+});
+
+test('pure: the truncated final chunk never ends with a split surrogate pair', () => {
+  const chunks = pure.splitDiscordContent('🙂'.repeat(20000));
+  assert.equal(chunks.length,10);
+  assert.ok(chunks.every(chunk=>chunk.isWellFormed() && chunk.length<=2000));
+});
+
+test('protocol: every fatal close code latches automatic reconnect off', () => {
+  for(const code of [4004,4010,4011,4012,4013,4014]) {
+    const {state} = pure.reconnectDecisionForClose({...DS,sessionId:'s',seq:10,nextWatchdogAt:NOW-1,nextHeartbeatAt:NOW-1},code,NOW);
+    assert.equal(state.reconnectBlocked,true);
+    assert.equal(state.nextReconnectAt,null);
+    assert.equal(state.nextHeartbeatAt,null);
+    assert.equal(state.nextWatchdogAt,null);
+  }
+});
+
+test('http: a 60-second rate limit is returned without retrying early', async () => {
+  const result=await send({channel_id:LONG_RATE_LIMIT_CHANNEL,content:'synthetic'},ADMIN_KEY);
+  assert.equal(result.status,429);
+  assert.equal(longRateLimitHits,1);
+});
+
+test('http: replies do not create automatic mention notifications', async () => {
+  await send({channel_id:'123456789',content:'@everyone <@123456789>'},ADMIN_KEY);
+  assert.deepEqual(lastDiscordSend.body.allowed_mentions,{parse:[]});
+});
+
+
+test('outbox: missing signing secret suspends the due timer without deleting queued rows', async () => {
+  const gateway = Object.create(pure.Gateway.prototype);
+  gateway.env = {};
+  gateway._lock = Promise.resolve();
+  let state={...DS,nextOutboxAt:NOW-1};
+  gateway.loadState=()=>({...state});
+  gateway.saveState=s=>(state={...s});
+  await gateway.deliverOutbox();
+  assert.equal(state.nextOutboxAt,null);
+  assert.equal(state.lastForwardError,'missing CLAUDE_HOOK_SECRET');
+});
+
+test('pure: attachGatewaySocket propagates accept failures for unopened sockets', () => {
+  assert.throws(() => pure.attachGatewaySocket({ws:{readyState:0,addEventListener(){},accept(){throw new Error('accept failed');}},handlers:{}}),/accept failed/);
+});
+
+test('gateway: callbacks from a replaced socket cannot mutate the live session', async () => {
+  const gateway = Object.create(pure.Gateway.prototype);
+  const current = {readyState:1};
+  const stale = {readyState:3};
+  gateway._socket=current;
+  gateway._socketMode='inline';
+  gateway._lock=Promise.resolve();
+  gateway.loadState=()=>assert.fail('stale callback must return before reading state');
+  await gateway.handleSocketMessage(stale,JSON.stringify({op:0,s:1,t:'READY',d:{session_id:'stale'}}));
+  await gateway.handleSocketClose(stale,4004,'stale',true);
+  await gateway.handleSocketError(stale,new Error('stale'));
+  assert.equal(gateway._socket,current);
+  assert.equal(gateway._socketMode,'inline');
 });

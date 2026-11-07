@@ -115,11 +115,15 @@ const BOT_CONFIGS = Object.freeze({
 const BOT_KEYS = Object.freeze(Object.keys(BOT_CONFIGS));
 const PRIMARY_BOT = "croissand";
 
+function knownBot(botKey) {
+  return typeof botKey === "string" && Object.hasOwn(BOT_CONFIGS, botKey);
+}
+
 // A bot is configured when both its token and its forward credential
 // are present in env. Unconfigured bots stay idle (no connection
 // attempts, no errors) while configured bots run normally.
 export function botConfigured(env, botKey) {
-  const config = BOT_CONFIGS[botKey];
+  const config = knownBot(botKey) ? BOT_CONFIGS[botKey] : null;
   if (!config || !env) return false;
   return Boolean(env[config.tokenEnv] && env[config.forwardSecretEnv]);
 }
@@ -309,7 +313,7 @@ export function forwardSecret(env) {
 // Resolve the effective { mode, secret } for one delivery: the bot's
 // static config when a bot is named, the legacy env fallback otherwise.
 function forwardTarget(env, bot) {
-  const config = bot ? BOT_CONFIGS[bot] : null;
+  const config = knownBot(bot) ? BOT_CONFIGS[bot] : null;
   if (config) {
     return {
       mode: config.forwardMode,
@@ -808,7 +812,8 @@ export class Gateway extends DurableObject {
     this._lock = Promise.resolve();
     // Live gateway sockets, one per bot: botKey -> { ws, mode } | null.
     this._sockets = {};
-    this._flushPromise = null;
+    this._connectPromises = {};
+    this._flushPromises = {};
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     );
@@ -858,6 +863,12 @@ export class Gateway extends DurableObject {
   // wrangler migrations are involved — the class name stays Gateway.
   // Safe to call repeatedly: it no-ops once the column exists.
   migrateStorage() {
+    // Keep both table rebuilds atomic, including a failure between DROP
+    // and RENAME. A retry must see the old rows, never an empty new table.
+    this.ctx.storage.transactionSync(() => this.migrateBotTables());
+  }
+
+  migrateBotTables() {
     this.ensureBotDimension(
       "outbox",
       "(bot TEXT NOT NULL DEFAULT 'croissand', request_id TEXT NOT NULL, " +
@@ -1028,9 +1039,11 @@ export class Gateway extends DurableObject {
     const now = Date.now();
     const candidates = [];
     for (const botKey of BOT_KEYS) {
+      if (!this.isConfigured(botKey)) continue;
       const state = this.loadState(botKey);
-      if (state.nextOutboxAt && !this._flushPromise) candidates.push(state.nextOutboxAt);
-      if (!state.reconnectBlocked && state.nextReconnectAt) candidates.push(state.nextReconnectAt);
+      const nextOutboxAt = state.nextOutboxAt ?? this.earliestOutboxAt(botKey);
+      if (nextOutboxAt && !this._flushPromises?.[botKey]) candidates.push(nextOutboxAt);
+      if (!state.reconnectBlocked && state.nextReconnectAt && !this._connectPromises?.[botKey]) candidates.push(state.nextReconnectAt);
       if (state.nextHeartbeatAt) candidates.push(state.nextHeartbeatAt);
       if (state.nextWatchdogAt) candidates.push(state.nextWatchdogAt);
       if (state.ready && state.lastDispatchAt) {
@@ -1070,27 +1083,28 @@ export class Gateway extends DurableObject {
       let bot = null;
       try {
         const body = await request.json();
-        if (body && typeof body.bot === "string" && BOT_CONFIGS[body.bot]) {
+        if (body && knownBot(body.bot)) {
           bot = body.bot;
         }
       } catch (_) {
         /* no body: nudge every bot */
       }
-      return this.runLocked(async () => {
-        if (bot) {
-          await this.connectLocked(bot, { manual: true });
-        } else {
-          for (const botKey of BOT_KEYS) {
-            await this.connectLocked(botKey, { manual: true });
-          }
+      const pending = await this.runLocked(async () => {
+        const targets = bot ? [bot] : BOT_KEYS;
+        for (const botKey of targets) {
+          await this.connectLocked(botKey, { manual: true });
         }
-        return jsonResponse(this.diagnosticsResponse());
+        return targets.map((botKey) => this._connectPromises?.[botKey]);
       });
+      // Only the caller waits for network I/O. Other sockets, alarms and
+      // status requests can keep using the shared object's state lock.
+      await Promise.all(pending);
+      return this.runLocked(() => jsonResponse(this.diagnosticsResponse()));
     }
     return new Response("not found", { status: 404 });
   }
 
-  // --- connection management (callers hold the lock) ---
+  // --- connection management ---
 
   async gatewayUrlForConnect(botKey, state) {
     if (
@@ -1122,16 +1136,23 @@ export class Gateway extends DurableObject {
     return withGatewayParams(base);
   }
 
+  // Callers hold the state lock only while reserving the attempt.
   async connectLocked(botKey = PRIMARY_BOT, { manual = false } = {}) {
-    const config = BOT_CONFIGS[botKey];
-    let state = this.loadState(botKey);
+    const state = this.loadState(botKey);
     if (manual) state.reconnectBlocked = false;
     if (state.reconnectBlocked) return this.statusSnapshot(botKey);
     state.configured = this.isConfigured(botKey);
     if (!state.configured) {
       state.connected = false;
       state.ready = false;
-      state.lastError = `missing ${config.tokenEnv} or ${config.forwardSecretEnv}`;
+      state.helloReceived = false;
+      state.awaitingHeartbeatAck = false;
+      state.nextHeartbeatAt = null;
+      state.nextReconnectAt = null;
+      state.nextWatchdogAt = null;
+      state.lastError = null;
+      const socket = this._sockets[botKey]?.ws;
+      if (socket) this.closeGatewaySocket(botKey, socket, "bot unconfigured");
       this.saveState(state, botKey);
       return this.statusSnapshot(botKey);
     }
@@ -1142,49 +1163,92 @@ export class Gateway extends DurableObject {
       await this.scheduleAlarmLocked();
       return this.statusSnapshot(botKey);
     }
+    this._connectPromises ||= {};
+    if (this._connectPromises[botKey]) return this.statusSnapshot(botKey);
     const stale = this._sockets[botKey]?.ws;
     if (stale) this.closeGatewaySocket(botKey, stale, "replaced");
     state.lastConnectAttemptAt = Date.now();
     state.reconnectAttempts = (state.reconnectAttempts || 0) + 1;
-    const url = await this.gatewayUrlForConnect(botKey, state);
-    try {
-      const ws = await openGatewaySocket(fetch, url);
-      const mode = attachGatewaySocket({
-        ctx: this.ctx,
-        ws,
-        handlers: {
-          onMessage: (data) => this.ctx.waitUntil(this.handleSocketMessage(botKey, ws, data)),
-          onClose: (code, reason, wasClean) =>
-            this.ctx.waitUntil(this.handleSocketClose(botKey, ws, code, reason, wasClean)),
-          onError: (error) => this.ctx.waitUntil(this.handleSocketError(botKey, ws, error)),
-        },
-      });
-      this._sockets[botKey] = { ws, mode };
-      state.connected = true;
-      state.ready = false;
-      state.helloReceived = false;
-      state.awaitingHeartbeatAck = false;
-      state.expectingClose = false;
-      state.socketOpenedAt = Date.now();
-      state.nextHeartbeatAt = null;
-      state.nextReconnectAt = null;
-      state.nextWatchdogAt = Date.now() + 30000; // hello timeout watchdog
-      state.lastError = null;
-    } catch (e) {
-      const failed = this._sockets[botKey]?.ws;
-      if (failed) this.closeGatewaySocket(botKey, failed, "connection failed");
-      state.connected = false;
-      state.ready = false;
-      state.lastError = `gateway connect failed: ${String(e).slice(0, 120)}`;
-      const delay = Math.min(
-        60000,
-        1000 * 2 ** Math.min(6, state.reconnectAttempts - 1)
-      );
-      state.nextReconnectAt = Date.now() + delay;
-    }
-    state = this.saveState(state, botKey);
+    state.connected = false;
+    state.ready = false;
+    state.helloReceived = false;
+    state.awaitingHeartbeatAck = false;
+    state.nextHeartbeatAt = null;
+    state.nextReconnectAt = null;
+    state.nextWatchdogAt = null;
+    this.saveState(state, botKey);
+    // Do not await this inside runLocked: a bot's lookup and Upgrade can
+    // each take ten seconds. Coalesce repeated nudges while it is pending.
+    const attempt = this.openBotConnection(botKey, state).finally(async () => {
+      delete this._connectPromises[botKey];
+      await this.runLocked(() => this.scheduleAlarmLocked());
+    });
+    this._connectPromises[botKey] = attempt;
+    this.ctx.waitUntil(attempt);
     await this.scheduleAlarmLocked();
     return this.statusSnapshot(botKey);
+  }
+
+  async openBotConnection(botKey, connectingState) {
+    let ws;
+    let error = null;
+    try {
+      const url = await this.gatewayUrlForConnect(botKey, connectingState);
+      ws = await openGatewaySocket(fetch, url);
+    } catch (e) {
+      error = `gateway connect failed: ${String(e).slice(0, 120)}`;
+    }
+    await this.runLocked(async () => {
+      // Outbox delivery and other activity may have saved newer counters
+      // during I/O. Merge connection fields into the current state only.
+      const state = this.loadState(botKey);
+      state.gatewayUrl = connectingState.gatewayUrl;
+      if (error) {
+        state.connected = false;
+        state.ready = false;
+        state.lastError = error;
+        const delay = Math.min(60000, 1000 * 2 ** Math.min(6, state.reconnectAttempts - 1));
+        state.nextReconnectAt = Date.now() + delay;
+        this.saveState(state, botKey);
+        return;
+      }
+      if (!this.isConfigured(botKey)) {
+        try { ws.close(4000, "bot unconfigured"); } catch (_) { /* already closed */ }
+        return;
+      }
+      // Install ownership before accept() can release queued frames.
+      this._sockets[botKey] = { ws, mode: "inline" };
+      try {
+        const mode = attachGatewaySocket({
+          ctx: this.ctx,
+          ws,
+          handlers: {
+            onMessage: (data) => this.ctx.waitUntil(this.handleSocketMessage(botKey, ws, data)),
+            onClose: (code, reason, wasClean) =>
+              this.ctx.waitUntil(this.handleSocketClose(botKey, ws, code, reason, wasClean)),
+            onError: (error) => this.ctx.waitUntil(this.handleSocketError(botKey, ws, error)),
+          },
+        });
+        this._sockets[botKey] = { ws, mode };
+        state.connected = true;
+        state.ready = false;
+        state.helloReceived = false;
+        state.awaitingHeartbeatAck = false;
+        state.expectingClose = false;
+        state.socketOpenedAt = Date.now();
+        state.nextHeartbeatAt = null;
+        state.nextReconnectAt = null;
+        state.nextWatchdogAt = Date.now() + 30000; // hello timeout watchdog
+        state.lastError = null;
+      } catch (e) {
+        this.closeGatewaySocket(botKey, ws, "connection failed");
+        state.connected = false;
+        state.ready = false;
+        state.lastError = `gateway connect failed: ${String(e).slice(0, 120)}`;
+        state.nextReconnectAt = Date.now() + Math.min(60000, 1000 * 2 ** Math.min(6, state.reconnectAttempts - 1));
+      }
+      this.saveState(state, botKey);
+    });
   }
 
   // --- gateway event handling ---
@@ -1349,6 +1413,7 @@ export class Gateway extends DurableObject {
   // and one bot's reconnect or heartbeat never touches the other's
   // session.
   async alarmBotLocked(botKey, now) {
+    if (!this.isConfigured(botKey)) return;
     let state = this.loadState(botKey);
     state.lastAlarmAt = now;
     this.saveState(state, botKey);
@@ -1469,103 +1534,99 @@ export class Gateway extends DurableObject {
     if (seen.length) return;
     this.insertOutbox(request, botKey);
     const state = this.loadState(botKey);
-    state.nextOutboxAt = Date.now();
+    // A replay may have hit INSERT OR IGNORE for a row already backing
+    // off. Respect its stored Retry-After instead of arming a busy loop.
+    state.nextOutboxAt = this.earliestOutboxAt(botKey);
     this.saveState(state, botKey);
-    // The caller arms an immediate alarm after persisting this row.
+    // The caller schedules the stored deadline after persisting this row.
   }
 
   // POST due outbox rows to dots-events, each in its own bot's forward
   // mode (see attemptForward). The receiver deduplicates by the body's
   // request_id, so retries never file a request twice.
   async flushOutbox() {
-    if (this._flushPromise) return this._flushPromise;
-    this._flushPromise = this.deliverOutbox().finally(async () => {
-      this._flushPromise = null;
-      await this.runLocked(() => this.scheduleAlarmLocked());
-    });
-    return this._flushPromise;
+    this._flushPromises ||= {};
+    return Promise.all(BOT_KEYS.map((botKey) => {
+      if (!this.isConfigured(botKey)) return;
+      if (this._flushPromises[botKey]) return this._flushPromises[botKey];
+      const delivery = this.deliverBotOutbox(botKey).finally(async () => {
+        delete this._flushPromises[botKey];
+        await this.runLocked(() => this.scheduleAlarmLocked());
+      });
+      this._flushPromises[botKey] = delivery;
+      return delivery;
+    }));
   }
 
   async deliverOutbox() {
-    const rows = await this.runLocked(() => this.ctx.storage.sql.exec(
-      "SELECT bot, request_id, body, attempts FROM outbox " +
-      "WHERE next_attempt_at <= ? ORDER BY created_at ASC LIMIT 10", Date.now()
-    ).toArray());
-    // Group by bot, preserving arrival order within each bot. A row
-    // whose bot is unknown (cannot happen with the current writers)
-    // is treated as the primary bot's.
-    const byBot = new Map();
+    return this.flushOutbox();
+  }
+
+  async deliverBotOutbox(botKey) {
+    // Bound each bot independently. Suspended rows must not occupy the
+    // other bot's batch, and a slow target must not delay its delivery.
+    const rows = await this.runLocked(() => {
+      const rows = this.ctx.storage.sql.exec(
+        "SELECT bot, request_id, body, attempts FROM outbox " +
+        "WHERE bot = ? AND next_attempt_at <= ? ORDER BY created_at ASC LIMIT 10",
+        botKey, Date.now()
+      ).toArray();
+      const state = this.loadState(botKey);
+      state.nextOutboxAt = this.earliestOutboxAt(botKey);
+      this.saveState(state, botKey);
+      return rows;
+    });
     for (const row of rows) {
-      const botKey = BOT_CONFIGS[row.bot] ? row.bot : PRIMARY_BOT;
-      if (!byBot.has(botKey)) byBot.set(botKey, []);
-      byBot.get(botKey).push(row);
-    }
-    for (const [botKey, botRows] of byBot) {
-      const config = BOT_CONFIGS[botKey];
-      if (!this.env[config.forwardSecretEnv]) {
-        // This bot's forward credential is gone: suspend its due
-        // timer and keep its rows queued, exactly as the single-bot
-        // version did deployment-wide. Other bots are unaffected.
-        await this.runLocked(() => {
-          const state = this.loadState(botKey);
-          state.lastForwardError = `missing ${config.forwardSecretEnv}`;
-          state.nextOutboxAt = null;
-          this.saveState(state, botKey);
-        });
-        continue;
+      const attempts = row.attempts + 1;
+      let delayMs = Math.min(60000, 1000 * 2 ** attempts);
+      const result = await attemptForward({
+        env: this.env,
+        bot: botKey,
+        fetchImpl: fetch,
+        requestId: row.request_id,
+        body: row.body,
+      });
+      const ok = result.delivered;
+      const error = result.error;
+      if (result.retryAfterMs !== null && result.retryAfterMs !== undefined) {
+        delayMs = Math.max(delayMs, result.retryAfterMs);
       }
-      for (const row of botRows) {
-        const attempts = row.attempts + 1;
-        let delayMs = Math.min(60000, 1000 * 2 ** attempts);
-        const result = await attemptForward({
-          env: this.env,
-          bot: botKey,
-          fetchImpl: fetch,
-          requestId: row.request_id,
-          body: row.body,
-        });
-        const ok = result.delivered;
-        const error = result.error;
-        if (result.retryAfterMs !== null && result.retryAfterMs !== undefined) {
-          delayMs = Math.max(delayMs, result.retryAfterMs);
-        }
-        await this.runLocked(async () => {
-          // Reload after I/O so concurrent ACK/session changes are never overwritten.
-          const state = this.loadState(botKey);
-          state.lastForwardError = error;
-          if (ok || result.final || attempts >= MAX_FORWARD_ATTEMPTS) {
+      await this.runLocked(async () => {
+        // Reload after I/O so concurrent ACK/session changes are never overwritten.
+        const state = this.loadState(botKey);
+        state.lastForwardError = error;
+        if (ok || result.final || attempts >= MAX_FORWARD_ATTEMPTS) {
+          this.ctx.storage.sql.exec(
+            "DELETE FROM outbox WHERE bot = ? AND request_id = ?",
+            botKey, row.request_id
+          );
+          if (ok || result.final) {
+            // forward_log dedups replays for a week. A final trigger
+            // failure (non-429 4xx) is logged here as failed — the
+            // request can never be filed, so a replay must not file
+            // it again — and counted as dropped below.
             this.ctx.storage.sql.exec(
-              "DELETE FROM outbox WHERE bot = ? AND request_id = ?",
-              botKey, row.request_id
-            );
-            if (ok || result.final) {
-              // forward_log dedups replays for a week. A final trigger
-              // failure (non-429 4xx) is logged here as failed — the
-              // request can never be filed, so a replay must not file
-              // it again — and counted as dropped below.
-              this.ctx.storage.sql.exec(
-                "INSERT OR REPLACE INTO forward_log (bot, request_id, completed_at) VALUES (?, ?, ?)",
-                botKey, row.request_id, Date.now()
-              );
-            }
-            if (ok) {
-              state.forwardedCount += 1;
-              state.lastForwardAt = Date.now();
-            } else state.droppedForwardCount += 1;
-          } else {
-            this.ctx.storage.sql.exec(
-              "UPDATE outbox SET attempts = ?, next_attempt_at = ? WHERE bot = ? AND request_id = ?",
-              attempts, Date.now() + delayMs, botKey, row.request_id
+              "INSERT OR REPLACE INTO forward_log (bot, request_id, completed_at) VALUES (?, ?, ?)",
+              botKey, row.request_id, Date.now()
             );
           }
+          if (ok) {
+            state.forwardedCount += 1;
+            state.lastForwardAt = Date.now();
+          } else state.droppedForwardCount += 1;
+        } else {
           this.ctx.storage.sql.exec(
-            "DELETE FROM forward_log WHERE completed_at < ?", Date.now() - 7 * 24 * 60 * 60 * 1000
+            "UPDATE outbox SET attempts = ?, next_attempt_at = ? WHERE bot = ? AND request_id = ?",
+            attempts, Date.now() + delayMs, botKey, row.request_id
           );
-          state.nextOutboxAt = this.earliestOutboxAt(botKey);
-          this.saveState(state, botKey);
-          await this.scheduleAlarmLocked();
-        });
-      }
+        }
+        this.ctx.storage.sql.exec(
+          "DELETE FROM forward_log WHERE completed_at < ?", Date.now() - 7 * 24 * 60 * 60 * 1000
+        );
+        state.nextOutboxAt = this.earliestOutboxAt(botKey);
+        this.saveState(state, botKey);
+        await this.scheduleAlarmLocked();
+      });
     }
   }
 
@@ -1728,7 +1789,7 @@ export async function patchBotAvatar(fetchImpl, token, mediaType, base64Data) {
 function selectBotKey(body) {
   const bot = body?.bot;
   if (bot === undefined || bot === null) return PRIMARY_BOT;
-  return typeof bot === "string" && BOT_CONFIGS[bot] ? bot : null;
+  return knownBot(bot) ? bot : null;
 }
 
 async function handleAvatar(env, request) {
@@ -2008,7 +2069,7 @@ export default {
             return jsonResponse({ error: "invalid JSON body" }, 400);
           }
           if (parsed && parsed.bot !== undefined && parsed.bot !== null) {
-            if (typeof parsed.bot !== "string" || !BOT_CONFIGS[parsed.bot]) {
+            if (!knownBot(parsed.bot)) {
               return jsonResponse({ error: "unknown bot" }, 400);
             }
             bot = parsed.bot;

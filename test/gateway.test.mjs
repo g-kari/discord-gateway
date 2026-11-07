@@ -868,16 +868,15 @@ test('http: replies do not create automatic mention notifications', async () => 
 });
 
 
-test('outbox: missing signing secret suspends the due timer without deleting queued rows', async () => {
+test('outbox: missing signing secret leaves queued rows and state quiet', async () => {
   const gateway = Object.create(pure.Gateway.prototype);
   gateway.env = {};
   gateway._lock = Promise.resolve();
   let state={...DS,nextOutboxAt:NOW-1};
   gateway.loadState=()=>({...state});
   gateway.saveState=s=>(state={...s});
-  // One due croissand row; with no CLAUDE_HOOK_SECRET in env the
-  // delivery pass must stamp the error on croissand's state and keep
-  // the row queued (no SQL writes beyond the due-row read).
+  // An unconfigured bot is skipped before SQL and network delivery.
+  // Its saved retry deadline is ignored by scheduling, not destroyed.
   gateway.ctx={storage:{sql:{exec:(sql)=>{
     if(sql.startsWith('SELECT bot, request_id, body, attempts FROM outbox')){
       return {toArray:()=>[{bot:'croissand',request_id:'discord-1',body:'{}',attempts:0}]};
@@ -885,8 +884,8 @@ test('outbox: missing signing secret suspends the due timer without deleting que
     throw new Error('unexpected SQL in test: '+sql);
   }}}};
   await gateway.deliverOutbox();
-  assert.equal(state.nextOutboxAt,null);
-  assert.equal(state.lastForwardError,'missing CLAUDE_HOOK_SECRET');
+  assert.equal(state.nextOutboxAt,NOW-1);
+  assert.equal(state.lastForwardError,null);
 });
 
 test('pure: attachGatewaySocket propagates accept failures for unopened sockets', () => {

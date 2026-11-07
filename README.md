@@ -11,7 +11,7 @@
 ## 構成
 
 - Cloudflare Worker `discord-gateway`。HTTP の入口（`/status`、`/connect`、`/send`、`/avatar`）だけを担う。
-- 永続化と Gateway 接続は **Durable Object（SQLite、クラス `Gateway`、グローバル単一インスタンス）に集約**。Bot ごとに接続を1本ずつ張り、接続状態（session_id、resume URL、最終 seq、bot のユーザー ID）と、転送に失敗した依頼の outbox を SQLite に保存する（状態は Bot ごとの行、outbox / forward_log は Bot 列つき）。再デプロイやオブジェクト再起動後は永続化した状態でセッション再開（Resume）を試みる。単一 Bot 時代の状態行（kv キー `gateway-state`）と bot 列のないテーブルは、初回読み込み時に croissand のものとしてそのまま引き継ぐ（クラス変更・wrangler マイグレーションなし）。
+- 永続化と Gateway 接続は **Durable Object（SQLite、クラス `Gateway`、グローバル単一インスタンス）に集約**。Bot ごとに接続を1本ずつ張り、接続状態（session_id、resume URL、最終 seq、bot のユーザー ID）と、転送に失敗した依頼の outbox を SQLite に保存する（状態は Bot ごとの行、outbox / forward_log は Bot 列つき）。再デプロイやオブジェクト再起動後は永続化した状態でセッション再開（Resume）を試みる。単一 Bot 時代の状態行（kv キー `gateway-state`）と bot 列のないテーブルは、初回読み込み時に croissand のものとしてそのまま引き継ぐ。テーブル再構築は同期トランザクションでまとめ、途中失敗時は両テーブルを元に戻して再試行する（クラス変更・wrangler マイグレーションなし）。
 - Gateway 接続は **通常の外向き WebSocket クライアント**（`fetch` Upgrade、`ws.accept()` と標準イベントリスナー）で保持する。Cloudflareの[公式仕様](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)では、外向き接続はハイバネーション非対応。接続中はDurable Objectの実行時間課金が発生する。Hello（op 10）でハートビート間隔を受け取り、DO の alarm でハートビート（op 1）を回す。alarm の起床時刻は **全 Bot のうち最も早い期限**（ハートビート／再接続／outbox 再試行／監視）に合わせる。ACK が返らない接続はゾンビとして切り、Resume（op 6）で再接続する。Hello後の初回ハートビートにはjitterを加える。ハンドシェイク監視はREADY/RESUMEDで解除する。切断時はclose codeに応じてセッションを保持／破棄し、バックオフつきで再接続する。4011を含むfatal codeでは自動再接続を停止し、原因修正後の管理キー付き`POST /connect`で再開する。alarm は接続の自己復旧（self-start）も兼ねる。これらはすべて Bot 単位で独立に判定される。
 - 生存監視はハートビート ACK だけでなく、**最終 DISPATCH 時刻**も見る。ACK は返るのにイベントが4時間届かない「聞こえないソケット」は強制的に張り直す（Resume するので実害は小さい）。
 
@@ -22,7 +22,7 @@
 - 対象: その Bot への **DM**、または **その Bot がメンションされたギルドメッセージ**（判定は受信した接続の Bot に対して行う）。Bot 自身と他の Bot の発言は無視する。両方の Bot がメンションされたメッセージは、各 Bot が自分の転送先へ1件ずつ投入する。
 - 転送 body: `{"text", "topic": "discord", "request_id": "discord-<message id>"}`。`text` の1行目は `[discord channel:<channel_id> guild:<guild_id or -> author:<username>]` で、本文からその Bot のメンションを取り除く。コードのインデントなど本文内の空白は保持する。返信先チャンネルはこの行で分かる。
 - 署名: croissand は Standard Webhooks（`webhook-id` / `webhook-timestamp` / `webhook-signature`、HMAC-SHA256）。dots-kick-events の実装と同一形式。ichihime は署名せず、`Authorization: Bearer <EVENTS_TRIGGER_KEY>` で `/trigger` に送る。
-- 転送はまずoutboxに永続化し、alarmからロック外のバックグラウンド配送を開始する。転送先の応答待ち中もACK・heartbeat・status処理を続け、1試行のタイムアウトは10秒。失敗はoutboxに残し、最大5回まで再試行する（受信側が `request_id` で重複排除するので再送は安全）。受信側が 429 を返したら `Retry-After` を尊重する。例外として trigger（ichihime）では、429 以外の 4xx は「依頼自体が拒否された」として再試行せず、その時点で失敗として `forward_log` に記録する（再生で再送されてきても再投入しない）。
+- 転送はまずoutboxに永続化し、alarmからロック外のバックグラウンド配送を開始する。接続時のGateway照会・Upgradeと転送先の応答待ちを共有ロック外で行い、片方が遅くても他方の配送・ACK・heartbeat・status処理を続け、1試行のタイムアウトは10秒。失敗はoutboxに残し、最大5回まで再試行する（受信側が `request_id` で重複排除するので再送は安全）。受信側が 429 を返したら `Retry-After` を尊重する。例外として trigger（ichihime）では、429 以外の 4xx は「依頼自体が拒否された」として再試行せず、その時点で失敗として `forward_log` に記録する（再生で再送されてきても再投入しない）。
 - 転送済みの `request_id` は `forward_log` に1週間保持し、Resume 再生で同じメッセージが再送されてきたらローカルで弾く（受信側の重複排除と二重化）。重複排除は Bot 単位（同じメッセージでも Bot ごとに1回は転送する）。
 
 ### 出口（Agent → Discord）
@@ -93,7 +93,7 @@ npm install
 npm test
 ```
 
-Miniflareと純関数の単体テスト（`test/gateway.test.mjs`）に加え、`test/lifecycle.test.mjs`では固定依存版workerd内のローカルDiscord代替と実際のWebSocketを使い、Hello→Identify→READY、Resume、fatal停止、遅いWebhook配送中のheartbeat/ACK/statusと重複排除を検証する。`test/forward-mode.test.mjs`では `FORWARD_MODE` の振り分け（既定=署名つき `/claude-hook`、trigger=Bearer で `/trigger`・署名ヘッダなし）と、trigger モードの再試行分類（429以外の4xxは終了、5xxは再試行）を検証する。`test/multi-bot.test.mjs`では2 Bot 相乗り（Bot ごとの転送・状態分離・状態移行・未構成 Bot の静穏・`/send` の bot 選択・`/status` の bots 詳細・alarm の最早期限・SQLite の bot 列移行）を検証する。署名形式が dots-kick-events と一致すること、MESSAGE_CREATE のフィルタ（自他の Bot を無視／DM を転送／メンションを転送／通常発言を無視）、Gateway プロトコルの判断（Hello→Identify／Resume、READY のセッション保存、Invalid Session の可否、ハートビート ACK 欠落時の再接続、fatal close code でのセッション破棄、4014 の案内文、DISPATCH 無音時の再接続判断）、`/send` の認証拒否・2000文字超の分割送信・429 リトライ、2000文字分割と `retry_after` 解釈の純関数、`/status` の形を検証する。
+複数のworkerd試験環境が短い監視期限を奪い合わないよう、`npm test` はファイル単位で直列実行する（各試験内の複数ソケット・並行I/Oは実際に同時実行する）。Miniflareと純関数の単体テスト（`test/gateway.test.mjs`）に加え、`test/lifecycle.test.mjs`では固定依存版workerd内のローカルDiscord代替と実際のWebSocketを使い、Hello→Identify→READY、Resume、fatal停止、遅いWebhook配送中のheartbeat/ACK/statusと重複排除を検証する。`test/forward-mode.test.mjs`では `FORWARD_MODE` の振り分け（既定=署名つき `/claude-hook`、trigger=Bearer で `/trigger`・署名ヘッダなし）と、trigger モードの再試行分類（429以外の4xxは終了、5xxは再試行）を検証する。`test/multi-bot-lifecycle.test.mjs`では同じDO内の2本の実WebSocketで、Bot別のIdentify/READY・転送・重複排除・片方のUpgrade停止中の他方のheartbeat/ACK・fatal停止の分離を検証する。`test/multi-bot.test.mjs`では2 Bot 相乗り（Bot ごとの転送・状態分離・状態移行・未構成 Bot の静穏・`/send` の bot 選択・`/status` の bots 詳細・alarm の最早期限・SQLite の bot 列移行と途中失敗後のrollback/再試行、未設定Botの滞留行による配送の妨害防止、リプレイ時の再試行期限維持）を検証する。署名形式が dots-kick-events と一致すること、MESSAGE_CREATE のフィルタ（自他の Bot を無視／DM を転送／メンションを転送／通常発言を無視）、Gateway プロトコルの判断（Hello→Identify／Resume、READY のセッション保存、Invalid Session の可否、ハートビート ACK 欠落時の再接続、fatal close code でのセッション破棄、4014 の案内文、DISPATCH 無音時の再接続判断）、`/send` の認証拒否・2000文字超の分割送信・429 リトライ、2000文字分割と `retry_after` 解釈の純関数、`/status` の形を検証する。
 
 **未カバー**: 実Discord Gatewayへの接続、実トークン・権限・ネットワーク・本番配送。ローカル代替とのソケット接続はテストするが、実サービスでの疎通は別途確認が必要。テストは実Discordや本番Webhookへ接続しない。
 

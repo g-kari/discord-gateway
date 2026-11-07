@@ -282,9 +282,9 @@ function fakeSql(outboxRows) {
   const forwardLog = new Map();
   const exec = (sql, ...params) => {
     if (sql.startsWith("SELECT bot, request_id, body, attempts FROM outbox")) {
-      const now = params[0];
+      const [bot, now] = params;
       const rows = [...outbox.values()]
-        .filter((r) => r.next_attempt_at <= now)
+        .filter((r) => r.bot === bot && r.next_attempt_at <= now)
         .sort((a, b) => a.created_at - b.created_at)
         .slice(0, 10);
       return { toArray: () => rows };
@@ -355,13 +355,13 @@ async function withGlobalFetch(impl, fn) {
   }
 }
 
-test("outbox: a bot without its trigger key suspends with a bot-specific error", async () => {
+test("outbox: a bot without its trigger key stays quiet and preserves queued rows", async () => {
   const store = fakeSql([dueRow("ichihime")]);
   const gateway = gatewayWithStore({}, store);
   await gateway.deliverOutbox();
   assert.equal(
     gateway.getState().lastForwardError,
-    "missing EVENTS_TRIGGER_KEY"
+    null
   );
   assert.equal(gateway.getState().nextOutboxAt, null);
   assert.equal(store.outbox.size, 1); // row kept, not deleted
@@ -370,7 +370,7 @@ test("outbox: a bot without its trigger key suspends with a bot-specific error",
 test("outbox: trigger 4xx drops the row and logs the request_id as failed", async () => {
   const store = fakeSql([dueRow("ichihime")]);
   const gateway = gatewayWithStore(
-    { EVENTS_TRIGGER_KEY: TRIGGER_KEY },
+    { DISCORD_BOT_TOKEN_ICHICHIME: "synthetic-token", EVENTS_TRIGGER_KEY: TRIGGER_KEY },
     store
   );
   const { impl, calls } = fakeFetch(new Response("bad request", { status: 400 }));
@@ -390,7 +390,7 @@ test("outbox: trigger 4xx drops the row and logs the request_id as failed", asyn
 test("outbox: trigger 5xx keeps the row queued for a retry", async () => {
   const store = fakeSql([dueRow("ichihime")]);
   const gateway = gatewayWithStore(
-    { EVENTS_TRIGGER_KEY: TRIGGER_KEY },
+    { DISCORD_BOT_TOKEN_ICHICHIME: "synthetic-token", EVENTS_TRIGGER_KEY: TRIGGER_KEY },
     store
   );
   const { impl } = fakeFetch(new Response("unavailable", { status: 503 }));
@@ -407,7 +407,7 @@ test("outbox: trigger 5xx keeps the row queued for a retry", async () => {
 test("outbox: claude-hook success still forwards, logs, and counts (regression)", async () => {
   const store = fakeSql([dueRow("croissand")]);
   const gateway = gatewayWithStore(
-    { CLAUDE_HOOK_SECRET: HOOK_SECRET },
+    { DISCORD_BOT_TOKEN: "synthetic-token", CLAUDE_HOOK_SECRET: HOOK_SECRET },
     store
   );
   const { impl, calls } = fakeFetch(okJson());

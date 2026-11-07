@@ -70,6 +70,9 @@ function fakeKv() {
       map.delete(params[0]);
       return { toArray: () => [] };
     }
+    if (sql.startsWith("SELECT MIN(next_attempt_at)")) {
+      return { toArray: () => [{ m: null }] };
+    }
     throw new Error(`unexpected SQL in test: ${sql}`);
   };
   return { exec, map };
@@ -84,7 +87,8 @@ function makeGateway(env, exec) {
   gateway.env = env;
   gateway._lock = Promise.resolve();
   gateway._sockets = {};
-  gateway._flushPromise = null;
+  gateway._flushPromises = {};
+  gateway._connectPromises = {};
   gateway.ctx = {
     storage: {
       sql: { exec },
@@ -108,6 +112,26 @@ async function withGlobalFetch(impl, fn) {
     return await fn();
   } finally {
     globalThis.fetch = original;
+  }
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
+async function completesPromptly(promise, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), 500);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -300,6 +324,49 @@ test("isolation: Identify on ichihime's connection carries ichihime's token", as
   assert.equal(gateway.loadState("croissand").botUserId, null);
 });
 
+test("isolation: a pending connect leaves the other bot's heartbeat, ACK and status live", async () => {
+  const kv = fakeKv();
+  const { gateway, flushes } = makeGateway({
+    DISCORD_BOT_TOKEN: CROISSAND_TOKEN,
+    CLAUDE_HOOK_SECRET: HOOK_SECRET,
+    DISCORD_BOT_TOKEN_ICHICHIME: ICHIHIME_TOKEN,
+    EVENTS_TRIGGER_KEY: TRIGGER_KEY,
+  }, kv.exec);
+  gateway.flushOutbox = async () => {};
+  const sent = [];
+  const ws = { readyState: 1, close() {}, send: (data) => sent.push(JSON.parse(data)) };
+  gateway._sockets.ichihime = { ws, mode: "inline" };
+  gateway.saveState({ ...DS, connected: true, ready: true, helloReceived: true,
+    lastDispatchAt: Date.now(), nextHeartbeatAt: Date.now() - 1, seq: 17 }, "ichihime");
+  const entered = deferred();
+  const release = deferred();
+  const impl = async () => {
+    entered.resolve();
+    await release.promise;
+    throw new Error("synthetic connection failure");
+  };
+  await withGlobalFetch(impl, async () => {
+    const connect = gateway.fetch(new Request("https://local/internal/connect", {
+      method: "POST", body: JSON.stringify({ bot: "croissand" }),
+    }));
+    await entered.promise;
+    try {
+      await completesPromptly(gateway.alarm(), "heartbeat blocked by another bot's connect");
+      assert.ok(sent.some((f) => f.op === 1 && f.d === 17));
+      await completesPromptly(gateway.handleSocketMessage("ichihime", ws, JSON.stringify({ op: 11 })),
+        "ACK blocked by another bot's connect");
+      assert.equal(gateway.loadState("ichihime").awaitingHeartbeatAck, false);
+      const res = await completesPromptly(gateway.fetch(new Request("https://local/internal/status")),
+        "status blocked by another bot's connect");
+      assert.equal((await res.json()).bots.ichihime.ready, true);
+    } finally {
+      release.resolve();
+      await connect;
+      await Promise.all(flushes);
+    }
+  });
+});
+
 test("isolation: enqueueForward files and dedups per bot", async () => {
   const logged = new Set(["croissand:discord-x"]);
   const inserts = [];
@@ -318,6 +385,9 @@ test("isolation: enqueueForward files and dedups per bot", async () => {
     if (sql.startsWith("INSERT OR IGNORE INTO outbox")) {
       inserts.push({ bot: params[0], request_id: params[1] });
       return { toArray: () => [] };
+    }
+    if (sql.startsWith("SELECT MIN(next_attempt_at)")) {
+      return { toArray: () => [{ m: inserts.some((r) => r.bot === params[0]) ? Date.now() : null }] };
     }
     throw new Error(`unexpected SQL in test: ${sql}`);
   };
@@ -346,9 +416,9 @@ function fakeOutbox(rows) {
   const forwardLog = new Map();
   const exec = (sql, ...params) => {
     if (sql.startsWith("SELECT bot, request_id, body, attempts FROM outbox")) {
-      const now = params[0];
+      const [bot, now] = params;
       const due = [...outbox.values()]
-        .filter((r) => r.next_attempt_at <= now)
+        .filter((r) => r.bot === bot && r.next_attempt_at <= now)
         .sort((a, b) => a.created_at - b.created_at)
         .slice(0, 10);
       return { toArray: () => due };
@@ -404,7 +474,8 @@ test("outbox: each bot's rows are delivered in that bot's own mode", async () =>
     row("ichihime", "discord-same"),
   ]);
   const { gateway } = makeGateway(
-    { CLAUDE_HOOK_SECRET: HOOK_SECRET, EVENTS_TRIGGER_KEY: TRIGGER_KEY },
+    { DISCORD_BOT_TOKEN: CROISSAND_TOKEN, CLAUDE_HOOK_SECRET: HOOK_SECRET,
+      DISCORD_BOT_TOKEN_ICHICHIME: ICHIHIME_TOKEN, EVENTS_TRIGGER_KEY: TRIGGER_KEY },
     store.exec
   );
   const states = { croissand: { ...DS }, ichihime: { ...DS } };
@@ -437,6 +508,103 @@ test("outbox: each bot's rows are delivered in that bot's own mode", async () =>
   assert.ok(store.forwardLog.has("ichihime:discord-same"));
 });
 
+test("outbox: more than a batch of suspended rows cannot starve a configured bot", async () => {
+  const row = (bot, n) => ({ bot, request_id: `discord-${bot}-${n}`, body: BODY,
+    attempts: 2, next_attempt_at: 1, created_at: n });
+  const store = fakeOutbox([
+    ...Array.from({ length: 12 }, (_, n) => row("croissand", n)),
+    row("ichihime", 100),
+  ]);
+  const { gateway } = makeGateway({
+    DISCORD_BOT_TOKEN_ICHICHIME: ICHIHIME_TOKEN, EVENTS_TRIGGER_KEY: TRIGGER_KEY,
+  }, store.exec);
+  const states = { croissand: { ...DS }, ichihime: { ...DS } };
+  gateway.loadState = (k) => ({ ...states[k] });
+  gateway.saveState = (s, k) => (states[k] = { ...s });
+  gateway.scheduleAlarmLocked = async () => {};
+  const calls = [];
+  await withGlobalFetch(async (url) => {
+    calls.push(url);
+    return new Response("ok");
+  }, () => gateway.flushOutbox());
+  assert.deepEqual(calls, ["https://dots-events.0g0.xyz/trigger"]);
+  assert.equal(store.outbox.size, 12);
+  assert.ok([...store.outbox.values()].every((r) => r.bot === "croissand" && r.attempts === 2));
+  assert.equal(states.croissand.lastForwardError, null);
+});
+
+test("outbox: a missing bot token also suspends delivery without consuming attempts", async () => {
+  const store = fakeOutbox([{ bot: "ichihime", request_id: "discord-pending", body: BODY,
+    attempts: 2, next_attempt_at: 1, created_at: 1 }]);
+  const { gateway } = makeGateway({ EVENTS_TRIGGER_KEY: TRIGGER_KEY }, store.exec);
+  await withGlobalFetch(() => assert.fail("unconfigured bot made a network request"),
+    () => gateway.flushOutbox());
+  assert.equal(store.outbox.get("ichihime:discord-pending").attempts, 2);
+});
+
+test("outbox: a replay of a queued retry preserves its backoff deadline", async () => {
+  const retryAt = Date.now() + 3600000;
+  const store = fakeOutbox([{ bot: "ichihime", request_id: "discord-retry", body: BODY,
+    attempts: 1, next_attempt_at: retryAt, created_at: 1 }]);
+  const kv = fakeKv();
+  const exec = (sql, ...params) => {
+    if (sql.startsWith("SELECT request_id FROM forward_log")) return { toArray: () => [] };
+    if (sql.startsWith("INSERT OR IGNORE INTO outbox")) return { toArray: () => [] };
+    if (sql.includes("FROM kv") || sql.startsWith("INSERT INTO kv")) return kv.exec(sql, ...params);
+    return store.exec(sql, ...params);
+  };
+  const { gateway, alarmSets } = makeGateway({
+    DISCORD_BOT_TOKEN_ICHICHIME: ICHIHIME_TOKEN, EVENTS_TRIGGER_KEY: TRIGGER_KEY,
+  }, exec);
+  await gateway.enqueueForward({ request_id: "discord-retry" }, "ichihime");
+  assert.equal(gateway.loadState("ichihime").nextOutboxAt, retryAt);
+  await gateway.flushOutbox();
+  await gateway.scheduleAlarmLocked();
+  assert.ok(alarmSets.at(-1) - Date.now() > 59000, "replayed retry armed an immediate alarm");
+  // Heal any stale cached deadline left by an older deployment too.
+  gateway.saveState({ ...gateway.loadState("ichihime"), nextOutboxAt: 1 }, "ichihime");
+  await gateway.flushOutbox();
+  assert.equal(gateway.loadState("ichihime").nextOutboxAt, retryAt);
+});
+
+test("outbox: a slow bot's target does not block or duplicate the other bot's delivery", async () => {
+  const store = fakeOutbox(["croissand", "ichihime"].map((bot) => ({
+    bot, request_id: `discord-${bot}`, body: BODY, attempts: 0, next_attempt_at: 1, created_at: 1,
+  })));
+  const { gateway } = makeGateway({
+    DISCORD_BOT_TOKEN: CROISSAND_TOKEN, CLAUDE_HOOK_SECRET: HOOK_SECRET,
+    DISCORD_BOT_TOKEN_ICHICHIME: ICHIHIME_TOKEN, EVENTS_TRIGGER_KEY: TRIGGER_KEY,
+  }, store.exec);
+  const states = { croissand: { ...DS }, ichihime: { ...DS } };
+  gateway.loadState = (k) => ({ ...states[k] });
+  gateway.saveState = (s, k) => (states[k] = { ...s });
+  gateway.scheduleAlarmLocked = async () => {};
+  const release = deferred();
+  const entered = deferred();
+  const fastDone = deferred();
+  const calls = [];
+  await withGlobalFetch(async (url) => {
+    calls.push(url);
+    if (url.endsWith("/claude-hook")) { entered.resolve(); await release.promise; }
+    else fastDone.resolve();
+    return new Response("ok");
+  }, async () => {
+    const pending = gateway.flushOutbox();
+    await entered.promise;
+    try {
+      await completesPromptly(fastDone.promise, "other bot's outbox blocked by a slow target");
+      await gateway.runLocked(() => {});
+      const again = gateway.flushOutbox();
+      release.resolve();
+      await Promise.all([pending, again]);
+    } finally { release.resolve(); await pending; }
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(store.outbox.size, 0);
+  assert.equal(states.croissand.forwardedCount, 1);
+  assert.equal(states.ichihime.forwardedCount, 1);
+});
+
 // ---------- unconfigured bot stays idle ----------
 
 test("unconfigured ichihime: quiet under connect and alarm; croissand unaffected", async () => {
@@ -451,13 +619,13 @@ test("unconfigured ichihime: quiet under connect and alarm; croissand unaffected
     { DISCORD_BOT_TOKEN: CROISSAND_TOKEN, CLAUDE_HOOK_SECRET: HOOK_SECRET },
     exec
   );
-  // A manual nudge reports ichihime as unconfigured and records why,
-  // but creates no socket and throws nothing.
+  // A manual nudge reports ichihime as unconfigured, without creating
+  // a socket or recording an error.
   const snap = await gateway.connectLocked("ichihime", { manual: true });
   assert.deepEqual(snap, { connected: false, ready: false, configured: false });
   assert.equal(
     gateway.loadState("ichihime").lastError,
-    "missing DISCORD_BOT_TOKEN_ICHICHIME or EVENTS_TRIGGER_KEY"
+    null
   );
   assert.equal(gateway._sockets.ichihime ?? null, null);
   // Under alarm, ichihime is skipped entirely (no connect attempt:
@@ -510,6 +678,20 @@ test("alarm: the wake-up is the earliest deadline across both bots", async () =>
     delta2 >= 29000 && delta2 <= 31000,
     `expected ~30000ms, got ${delta2}`
   );
+});
+
+test("alarm: stale deadlines of an unconfigured bot cannot cause a 250ms loop", async () => {
+  const kv = fakeKv();
+  const { gateway, alarmSets } = makeGateway({
+    DISCORD_BOT_TOKEN_ICHICHIME: ICHIHIME_TOKEN, EVENTS_TRIGGER_KEY: TRIGGER_KEY,
+  }, kv.exec);
+  const now = Date.now();
+  gateway.saveState({ ...DS, nextHeartbeatAt: now - 1, nextWatchdogAt: now - 1,
+    nextReconnectAt: now - 1, nextOutboxAt: now - 1, ready: true, lastDispatchAt: 1 }, "croissand");
+  gateway.saveState({ ...DS, nextHeartbeatAt: now + 30000 }, "ichihime");
+  await gateway.alarmBotLocked("croissand", now);
+  await gateway.scheduleAlarmLocked();
+  assert.ok(alarmSets[0] - Date.now() > 29000);
 });
 
 // ---------- HTTP surface on Miniflare ----------
@@ -630,6 +812,17 @@ test("http: /send with an unconfigured bot is a 500, unknown bot a 400", async (
   assert.equal(unknownConnect.status, 400);
 });
 
+test("http: inherited object names are unknown bots on every admin endpoint", async () => {
+  for (const bot of ["__proto__", "constructor", "toString"]) {
+    for (const path of ["/send", "/avatar", "/connect"]) {
+      const res = await post(mfA, path, { bot, channel_id: "123456789", content: "hi", image_base64: PNG_1PX_B64 });
+      assert.equal(res.status, 400, `${path} accepted ${bot}`);
+      assert.equal(res.json.error, "unknown bot");
+    }
+    assert.equal(pure.botConfigured({ undefined: "trap" }, bot), false);
+  }
+});
+
 let mfB;
 let recB;
 before(async () => {
@@ -692,7 +885,10 @@ const workerSource = readFileSync(
   "utf8"
 );
 const migrationFixture =
-  workerSource.replace("export default {", "const productionWorker = {") +
+  workerSource.replace("export default {", "const productionWorker = {")
+    .replace('this.ctx.storage.sql.exec(`ALTER TABLE ${tmp} RENAME TO ${table}`);',
+      'if (this.failMigrationTable === table) throw new Error("synthetic migration failure");\n' +
+      'this.ctx.storage.sql.exec(`ALTER TABLE ${tmp} RENAME TO ${table}`);') +
   `
 export class TestGateway extends Gateway {
  async fetch(request) {
@@ -710,6 +906,16 @@ export class TestGateway extends Gateway {
    return new Response('ok');
   }
   if (path === '/test/migrate') { this.migrateStorage(); return new Response('ok'); }
+  if (path === '/test/migrate-fault') {
+   this.failMigrationTable = new URL(request.url).searchParams.get('table');
+   try { this.migrateStorage(); return Response.json({ error: 'fault did not fire' }, { status: 500 }); }
+   catch (e) { return Response.json({ error: e.message,
+    outbox: this.ctx.storage.sql.exec('SELECT * FROM outbox').toArray(),
+    forwardLog: this.ctx.storage.sql.exec('SELECT * FROM forward_log').toArray(),
+    tables: this.ctx.storage.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table'").toArray().map(r => r.name),
+   }); }
+   finally { this.failMigrationTable = null; }
+  }
   if (path === '/test/inspect') {
    const croissand = this.loadState('croissand');
    const ichihime = this.loadState('ichihime');
@@ -768,4 +974,23 @@ test("migration: pre-upgrade tables and state gain the bot dimension in place", 
   assert.equal(j.ichihime.sessionId, null);
   assert.ok(j.kvKeys.includes("gateway-state:croissand"));
   assert.ok(!j.kvKeys.includes("gateway-state"));
+});
+
+test("migration: a failure after either DROP rolls both tables back and retries without loss", async () => {
+  for (const table of ["outbox", "forward_log"]) {
+    await stubM.fetch("https://local/test/seed-legacy");
+    const failed = await (await stubM.fetch(`https://local/test/migrate-fault?table=${table}`)).json();
+    assert.equal(failed.error, "synthetic migration failure");
+    assert.deepEqual(failed.outbox, [{ request_id: "discord-old", body: "{}", attempts: 2,
+      next_attempt_at: 111, created_at: 100 }]);
+    assert.deepEqual(failed.forwardLog, [{ request_id: "discord-done", completed_at: 12345 }]);
+    assert.ok(!failed.tables.includes("outbox_v2"));
+    assert.ok(!failed.tables.includes("forward_log_v2"));
+    await stubM.fetch("https://local/test/migrate");
+    await stubM.fetch("https://local/test/migrate");
+    const retried = await (await stubM.fetch("https://local/test/inspect")).json();
+    assert.deepEqual(retried.outbox, [{ bot: "croissand", request_id: "discord-old", attempts: 2 }]);
+    assert.deepEqual(retried.forwardLog, [{ bot: "croissand", request_id: "discord-done", completed_at: 12345 }]);
+    assert.equal(retried.croissand.sessionId, "legacy-sess");
+  }
 });

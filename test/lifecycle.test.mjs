@@ -15,7 +15,7 @@ export class TestGateway extends Gateway {
    await this.runLocked(async () => {const state=this.saveState({...this.loadState(), ...await request.json()});await this.scheduleAlarmLocked(state);});
    return new Response('ok');
   }
-  if (path === '/test/alarm') { await this.alarm(); return new Response('ok'); }
+  if (path === '/test/alarm') { await this.ctx.storage.deleteAlarm(); await this.alarm(); return new Response('ok'); }
   if (path === '/test/alarm-at') return Response.json(await this.ctx.storage.getAlarm());
   if (path === '/test/outbox') return Response.json(this.ctx.storage.sql.exec('SELECT * FROM outbox').toArray());
   return super.fetch(request);

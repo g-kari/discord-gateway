@@ -1,0 +1,9 @@
+{
+  "endpoint": "",
+  "transport": "streamable-http",
+  "oauth_client_mode": "",
+  "owner_auth_verified": false,
+  "unauthenticated_rejected": false,
+  "outsider_rejected": false,
+  "tools": []
+}

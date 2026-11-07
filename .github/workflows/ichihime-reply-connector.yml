@@ -1,0 +1,40 @@
+name: Ichihime reply connector
+
+on:
+  push:
+    paths:
+      - 'connectors/ichihime-reply-mcp/**'
+      - '.github/workflows/ichihime-reply-connector.yml'
+  pull_request:
+    paths:
+      - 'connectors/ichihime-reply-mcp/**'
+      - '.github/workflows/ichihime-reply-connector.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: connectors/ichihime-reply-mcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts --legacy-peer-deps --no-audit --no-fund
+      - name: Check syntax
+        run: npm run check
+      - name: Test security core
+        run: npm test
+      - name: Build Worker
+        run: npm run build
+      - name: Install synthetic Workers runtime
+        run: npm install --no-save --package-lock=false --ignore-scripts --legacy-peer-deps --no-audit --no-fund miniflare@4.20260730.0
+      - name: Test OAuth and persistent delivery boundaries
+        run: node --test checks/*.integration.mjs
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high

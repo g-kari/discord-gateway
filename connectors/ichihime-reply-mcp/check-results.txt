@@ -1,0 +1,5 @@
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+
+> ichihime-discord-reply-connector@0.1.0 check
+> node --check src/core.mjs && node --check src/ledger.mjs && node --check src/worker.mjs && node --check tools/package-plugin.mjs
+

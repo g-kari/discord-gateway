@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ichihime-discord-reply-mcp",
+  "main": "src/worker.mjs",
+  "compatibility_date": "2026-07-30",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": false },
+  "vars": {
+    "SEND_ENABLED": "false",
+    "OWNER_SUBJECT": "",
+    "ALLOWED_TARGETS_JSON": "[]",
+    "MCP_SERVER_URL": "",
+    "AUTH_SERVER_URL": ""
+  },
+  "services": [
+    { "binding": "GATEWAY_SERVICE", "service": "discord-gateway" },
+    { "binding": "AUTH_SERVER", "service": "REPLACE_WITH_APPROVED_AUTH_SERVICE" }
+  ],
+  "durable_objects": { "bindings": [{ "name": "REPLY_LEDGER", "class_name": "ReplyLedger" }] },
+  "migrations": [{ "tag": "v1-reply-ledger", "new_sqlite_classes": ["ReplyLedger"] }]
+}

@@ -1,0 +1,52 @@
+PASS auth null
+PASS auth invalid
+PASS auth no-expiry
+PASS auth nan-expiry
+PASS auth expired
+PASS auth no-user
+PASS auth props-spoof
+PASS auth no-client
+PASS auth scope-string
+PASS auth no-scope
+PASS auth write
+PASS auth outsider
+PASS auth audience
+PASS auth throws
+PASS origin http://reply.test
+PASS origin https://reply.test:444
+PASS origin https://reply.test/
+PASS origin https://other.test
+PASS origin null
+PASS origin https://reply.test.evil.test
+PASS origin http://localhost
+PASS host/resource https://reply.test/mcp
+PASS host/resource https://evil.test/mcp
+PASS host/resource http://reply.test/mcp
+PASS owner discovery no-origin
+PASS owner discovery https://reply.test
+PASS read scope cannot send
+PASS unknown response reserves once
+PASS unknown altered content/target conflicts
+PASS numeric receipt rejected
+PASS SQLite concurrent reservation sends once
+PASS SQLite full restart keeps unknown/sent dedup
+INDEPENDENT_AUDIT_PASS checks=32
+✔ test/independent-audit.integration.mjs (2016.52038ms)
+✔ runtime OAuth: missing token is 401 with resource metadata challenge (795.093683ms)
+✔ runtime OAuth: protected resource discovery advertises only configured resource (9.969345ms)
+✔ runtime OAuth: invalid, wrong-audience, expired and failing validator denied (33.668225ms)
+✔ runtime MCP: initialize, tool discovery and owner status succeed (42.75207ms)
+✔ runtime MCP: modern protocol discovers tools without legacy initialize (10.221147ms)
+✔ runtime MCP: read-only token cannot send, other target/bot/mention rejected (28.22823ms)
+✔ runtime MCP: bad browser origin rejected without wildcard CORS (6.219605ms)
+✔ runtime SQLite ledger: send once, fixed bot/private secret, dedup survives new requests (26.047467ms)
+✔ runtime SQLite ledger: changed payload cannot evade same-source dedup (7.6822ms)
+✔ runtime SQLite ledger: receipt survives full runtime restart and no gateway call (599.113666ms)
+ℹ tests 11
+ℹ suites 0
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2024.841927

@@ -31,7 +31,7 @@ jobs:
       - name: Test security core
         run: npm test
       - name: Build Worker
-        run: npm run build
+        run: npm run build && npm run build:shared
       - name: Install synthetic Workers runtime
         run: npm install --no-save --package-lock=false --ignore-scripts --legacy-peer-deps --no-audit --no-fund miniflare@4.20260730.0
       - name: Test OAuth and persistent delivery boundaries

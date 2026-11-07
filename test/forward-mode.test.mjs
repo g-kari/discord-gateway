@@ -1,9 +1,12 @@
-// Tests for the FORWARD_MODE forward dispatch (worker.js):
-// - "claude-hook" (default): signed Standard Webhooks POST to
-//   dots-events /claude-hook, as before.
-// - "trigger": unsigned POST to dots-events /trigger with a Bearer
-//   EVENTS_TRIGGER_KEY, for second-bot deployments. A non-429 4xx is a
-//   final failure there; 5xx / 429 / network errors retry.
+// Tests for the forward dispatch (worker.js):
+// - Each bot forwards in its own mode, fixed by its static config:
+//   croissand → "claude-hook" (signed Standard Webhooks POST to
+//   dots-events /claude-hook); ichihime → "trigger" (unsigned POST to
+//   dots-events /trigger with a Bearer EVENTS_TRIGGER_KEY). A non-429
+//   4xx is a final failure in trigger mode; 5xx / 429 / network errors
+//   retry.
+// - attemptForward without a bot keeps the legacy env-driven dispatch
+//   (FORWARD_MODE), covered by the pure tests below.
 // Pure helpers are imported through the same source transform as
 // gateway.test.mjs; the Durable Object's deliverOutbox is exercised
 // with a fake in-memory SQL store and a stubbed global fetch.
@@ -80,24 +83,29 @@ test("forwardSecret: the credential follows the mode", () => {
   assert.equal(pure.forwardSecret({}), undefined);
 });
 
-test("isConfigured: trigger deployments need the trigger key, not the hook secret", () => {
+test("isConfigured: each bot needs its own token and forward credential", () => {
   const gateway = Object.create(pure.Gateway.prototype);
   gateway.env = { DISCORD_BOT_TOKEN: "t", CLAUDE_HOOK_SECRET: "s" };
-  assert.equal(gateway.isConfigured(), true);
+  assert.equal(gateway.isConfigured("croissand"), true);
+  assert.equal(gateway.isConfigured(), true); // defaults to croissand
+  assert.equal(gateway.isConfigured("ichihime"), false);
   gateway.env = {
-    DISCORD_BOT_TOKEN: "t",
-    FORWARD_MODE: "trigger",
+    DISCORD_BOT_TOKEN_ICHICHIME: "t",
     EVENTS_TRIGGER_KEY: "k",
   };
-  assert.equal(gateway.isConfigured(), true);
+  assert.equal(gateway.isConfigured("ichihime"), true);
+  assert.equal(gateway.isConfigured("croissand"), false);
+  // The other bot's credential never substitutes for one's own.
   gateway.env = {
-    DISCORD_BOT_TOKEN: "t",
-    FORWARD_MODE: "trigger",
+    DISCORD_BOT_TOKEN_ICHICHIME: "t",
     CLAUDE_HOOK_SECRET: "s",
   };
-  assert.equal(gateway.isConfigured(), false);
+  assert.equal(gateway.isConfigured("ichihime"), false);
   gateway.env = { DISCORD_BOT_TOKEN: "t" };
-  assert.equal(gateway.isConfigured(), false);
+  assert.equal(gateway.isConfigured("croissand"), false);
+  assert.equal(gateway.anyBotConfigured(), false);
+  gateway.env = { DISCORD_BOT_TOKEN_ICHICHIME: "t", EVENTS_TRIGGER_KEY: "k" };
+  assert.equal(gateway.anyBotConfigured(), true);
 });
 
 // ---------- attemptForward: claude-hook mode ----------
@@ -265,33 +273,39 @@ test("attemptForward: trigger 429 retries and surfaces the delay hint", async ()
 // ---------- deliverOutbox with a fake SQL store ----------
 
 // Minimal in-memory stand-in for the DO's SQLite tables, keyed on the
-// exact statements deliverOutbox and its helpers issue.
+// exact statements deliverOutbox and its helpers issue. Rows carry a
+// bot dimension now; the maps key on "<bot>:<request_id>".
 function fakeSql(outboxRows) {
-  const outbox = new Map(outboxRows.map((r) => [r.request_id, { ...r }]));
+  const outbox = new Map(
+    outboxRows.map((r) => [`${r.bot}:${r.request_id}`, { ...r }])
+  );
   const forwardLog = new Map();
   const exec = (sql, ...params) => {
-    if (sql.startsWith("SELECT request_id, body, attempts FROM outbox")) {
-      const now = params[0];
+    if (sql.startsWith("SELECT bot, request_id, body, attempts FROM outbox")) {
+      const [bot, now] = params;
       const rows = [...outbox.values()]
-        .filter((r) => r.next_attempt_at <= now)
+        .filter((r) => r.bot === bot && r.next_attempt_at <= now)
         .sort((a, b) => a.created_at - b.created_at)
         .slice(0, 10);
       return { toArray: () => rows };
     }
     if (sql.startsWith("SELECT MIN(next_attempt_at)")) {
-      const vals = [...outbox.values()].map((r) => r.next_attempt_at);
+      const bot = params[0];
+      const vals = [...outbox.values()]
+        .filter((r) => bot === undefined || r.bot === bot)
+        .map((r) => r.next_attempt_at);
       return { toArray: () => [{ m: vals.length ? Math.min(...vals) : null }] };
     }
     if (sql.startsWith("DELETE FROM outbox")) {
-      outbox.delete(params[0]);
+      outbox.delete(`${params[0]}:${params[1]}`);
       return { toArray: () => [] };
     }
     if (sql.startsWith("INSERT OR REPLACE INTO forward_log")) {
-      forwardLog.set(params[0], params[1]);
+      forwardLog.set(params[1], params[2]);
       return { toArray: () => [] };
     }
     if (sql.startsWith("UPDATE outbox")) {
-      const row = outbox.get(params[2]);
+      const row = outbox.get(`${params[2]}:${params[3]}`);
       if (row) {
         row.attempts = params[0];
         row.next_attempt_at = params[1];
@@ -322,7 +336,8 @@ function gatewayWithStore(env, store) {
   return gateway;
 }
 
-const dueRow = () => ({
+const dueRow = (bot = "ichihime") => ({
+  bot,
   request_id: "discord-42",
   body: BODY,
   attempts: 0,
@@ -340,22 +355,22 @@ async function withGlobalFetch(impl, fn) {
   }
 }
 
-test("outbox: trigger mode without the trigger key suspends with a mode-specific error", async () => {
-  const store = fakeSql([dueRow()]);
-  const gateway = gatewayWithStore({ FORWARD_MODE: "trigger" }, store);
+test("outbox: a bot without its trigger key stays quiet and preserves queued rows", async () => {
+  const store = fakeSql([dueRow("ichihime")]);
+  const gateway = gatewayWithStore({}, store);
   await gateway.deliverOutbox();
   assert.equal(
     gateway.getState().lastForwardError,
-    "missing EVENTS_TRIGGER_KEY"
+    null
   );
   assert.equal(gateway.getState().nextOutboxAt, null);
   assert.equal(store.outbox.size, 1); // row kept, not deleted
 });
 
 test("outbox: trigger 4xx drops the row and logs the request_id as failed", async () => {
-  const store = fakeSql([dueRow()]);
+  const store = fakeSql([dueRow("ichihime")]);
   const gateway = gatewayWithStore(
-    { FORWARD_MODE: "trigger", EVENTS_TRIGGER_KEY: TRIGGER_KEY },
+    { DISCORD_BOT_TOKEN_ICHICHIME: "synthetic-token", EVENTS_TRIGGER_KEY: TRIGGER_KEY },
     store
   );
   const { impl, calls } = fakeFetch(new Response("bad request", { status: 400 }));
@@ -373,15 +388,15 @@ test("outbox: trigger 4xx drops the row and logs the request_id as failed", asyn
 });
 
 test("outbox: trigger 5xx keeps the row queued for a retry", async () => {
-  const store = fakeSql([dueRow()]);
+  const store = fakeSql([dueRow("ichihime")]);
   const gateway = gatewayWithStore(
-    { FORWARD_MODE: "trigger", EVENTS_TRIGGER_KEY: TRIGGER_KEY },
+    { DISCORD_BOT_TOKEN_ICHICHIME: "synthetic-token", EVENTS_TRIGGER_KEY: TRIGGER_KEY },
     store
   );
   const { impl } = fakeFetch(new Response("unavailable", { status: 503 }));
   await withGlobalFetch(impl, () => gateway.deliverOutbox());
   assert.equal(store.outbox.size, 1);
-  const row = store.outbox.get("discord-42");
+  const row = store.outbox.get("ichihime:discord-42");
   assert.equal(row.attempts, 1);
   assert.ok(row.next_attempt_at > Date.now());
   assert.equal(store.forwardLog.size, 0);
@@ -390,9 +405,9 @@ test("outbox: trigger 5xx keeps the row queued for a retry", async () => {
 });
 
 test("outbox: claude-hook success still forwards, logs, and counts (regression)", async () => {
-  const store = fakeSql([dueRow()]);
+  const store = fakeSql([dueRow("croissand")]);
   const gateway = gatewayWithStore(
-    { CLAUDE_HOOK_SECRET: HOOK_SECRET },
+    { DISCORD_BOT_TOKEN: "synthetic-token", CLAUDE_HOOK_SECRET: HOOK_SECRET },
     store
   );
   const { impl, calls } = fakeFetch(okJson());

@@ -15,7 +15,7 @@ export class TestGateway extends Gateway {
    await this.runLocked(async () => {const state=this.saveState({...this.loadState(), ...await request.json()});await this.scheduleAlarmLocked(state);});
    return new Response('ok');
   }
-  if (path === '/test/alarm') { await this.alarm(); return new Response('ok'); }
+  if (path === '/test/alarm') { await this.ctx.storage.deleteAlarm(); await this.alarm(); return new Response('ok'); }
   if (path === '/test/alarm-at') return Response.json(await this.ctx.storage.getAlarm());
   if (path === '/test/outbox') return Response.json(this.ctx.storage.sql.exec('SELECT * FROM outbox').toArray());
   return super.fetch(request);
@@ -82,7 +82,11 @@ test('runtime: outgoing socket receives Hello, sends Identify, and reaches READY
  assert.equal((await connect()).status,200);
  await eventually(async()=>(await state()).ready,'READY was not received');
  const status=await mf.dispatchFetch('http://local/status');
- assert.deepEqual(await status.json(),{connected:true,ready:true});
+ const statusBody=await status.json();
+ assert.equal(statusBody.connected,true);
+ assert.equal(statusBody.ready,true);
+ assert.equal(statusBody.bots.croissand.ready,true);
+ assert.equal(statusBody.bots.ichihime.configured,false);
  const s=await state();
  assert.equal(s.nextWatchdogAt,null);
  assert.equal(s.sessionId,'synthetic-session');

@@ -35,6 +35,6 @@ jobs:
       - name: Install synthetic Workers runtime
         run: npm install --no-save --package-lock=false --ignore-scripts --legacy-peer-deps --no-audit --no-fund miniflare@4.20260730.0
       - name: Test OAuth and persistent delivery boundaries
-        run: node --test checks/*.integration.mjs
+        run: node --test --test-concurrency=1 checks/*.integration.mjs
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high

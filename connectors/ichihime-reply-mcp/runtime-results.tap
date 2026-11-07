@@ -1,52 +1,157 @@
-PASS auth null
-PASS auth invalid
-PASS auth no-expiry
-PASS auth nan-expiry
-PASS auth expired
-PASS auth no-user
-PASS auth props-spoof
-PASS auth no-client
-PASS auth scope-string
-PASS auth no-scope
-PASS auth write
-PASS auth outsider
-PASS auth audience
-PASS auth throws
-PASS origin http://reply.test
-PASS origin https://reply.test:444
-PASS origin https://reply.test/
-PASS origin https://other.test
-PASS origin null
-PASS origin https://reply.test.evil.test
-PASS origin http://localhost
-PASS host/resource https://reply.test/mcp
-PASS host/resource https://evil.test/mcp
-PASS host/resource http://reply.test/mcp
-PASS owner discovery no-origin
-PASS owner discovery https://reply.test
-PASS read scope cannot send
-PASS unknown response reserves once
-PASS unknown altered content/target conflicts
-PASS numeric receipt rejected
-PASS SQLite concurrent reservation sends once
-PASS SQLite full restart keeps unknown/sent dedup
-INDEPENDENT_AUDIT_PASS checks=32
-✔ test/independent-audit.integration.mjs (2016.52038ms)
-✔ runtime OAuth: missing token is 401 with resource metadata challenge (795.093683ms)
-✔ runtime OAuth: protected resource discovery advertises only configured resource (9.969345ms)
-✔ runtime OAuth: invalid, wrong-audience, expired and failing validator denied (33.668225ms)
-✔ runtime MCP: initialize, tool discovery and owner status succeed (42.75207ms)
-✔ runtime MCP: modern protocol discovers tools without legacy initialize (10.221147ms)
-✔ runtime MCP: read-only token cannot send, other target/bot/mention rejected (28.22823ms)
-✔ runtime MCP: bad browser origin rejected without wildcard CORS (6.219605ms)
-✔ runtime SQLite ledger: send once, fixed bot/private secret, dedup survives new requests (26.047467ms)
-✔ runtime SQLite ledger: changed payload cannot evade same-source dedup (7.6822ms)
-✔ runtime SQLite ledger: receipt survives full runtime restart and no gateway call (599.113666ms)
-ℹ tests 11
-ℹ suites 0
-ℹ pass 11
-ℹ fail 0
-ℹ cancelled 0
-ℹ skipped 0
-ℹ todo 0
-ℹ duration_ms 2024.841927
+TAP version 13
+# Subtest: independent workerd rejects a JWKS fetch that does not return headers within 3 seconds
+ok 1 - independent workerd rejects a JWKS fetch that does not return headers within 3 seconds
+  ---
+  duration_ms: 3446.767473
+  type: 'test'
+  ...
+# Subtest: independent workerd rejects a JWKS response body that stalls over 3 seconds
+ok 2 - independent workerd rejects a JWKS response body that stalls over 3 seconds
+  ---
+  duration_ms: 3412.582009
+  type: 'test'
+  ...
+# Subtest: independent workerd documents discovery and read-only-scope send behavior
+ok 3 - independent workerd documents discovery and read-only-scope send behavior
+  ---
+  duration_ms: 473.476387
+  type: 'test'
+  ...
+# Subtest: workerd production JWT mode authenticates real ES256 fixtures without AUTH_SERVER binding
+ok 4 - workerd production JWT mode authenticates real ES256 fixtures without AUTH_SERVER binding
+  ---
+  duration_ms: 641.561743
+  type: 'test'
+  ...
+# Subtest: workerd production JWT mode rejects missing mode or issuer configuration
+ok 5 - workerd production JWT mode rejects missing mode or issuer configuration
+  ---
+  duration_ms: 859.949548
+  type: 'test'
+  ...
+# Subtest: workerd production JWT mode fails closed for redirect
+ok 6 - workerd production JWT mode fails closed for redirect
+  ---
+  duration_ms: 254.0197
+  type: 'test'
+  ...
+# Subtest: workerd production JWT mode fails closed for oversized JWKS
+ok 7 - workerd production JWT mode fails closed for oversized JWKS
+  ---
+  duration_ms: 281.591312
+  type: 'test'
+  ...
+# Subtest: workerd production JWT mode fails closed for unavailable JWKS
+ok 8 - workerd production JWT mode fails closed for unavailable JWKS
+  ---
+  duration_ms: 296.671814
+  type: 'test'
+  ...
+# PASS auth null
+# PASS auth invalid
+# PASS auth no-expiry
+# PASS auth nan-expiry
+# PASS auth expired
+# PASS auth no-user
+# PASS auth props-spoof
+# PASS auth no-client
+# PASS auth scope-string
+# PASS auth no-scope
+# PASS auth write
+# PASS auth outsider
+# PASS auth audience
+# PASS auth throws
+# PASS origin http://reply.test
+# PASS origin https://reply.test:444
+# PASS origin https://reply.test/
+# PASS origin https://other.test
+# PASS origin null
+# PASS origin https://reply.test.evil.test
+# PASS origin http://localhost
+# PASS host/resource https://reply.test/mcp
+# PASS host/resource https://evil.test/mcp
+# PASS host/resource http://reply.test/mcp
+# PASS owner discovery no-origin
+# PASS owner discovery https://reply.test
+# PASS read scope cannot send
+# PASS unknown response reserves once
+# PASS unknown altered content/target conflicts
+# PASS numeric receipt rejected
+# PASS SQLite concurrent reservation sends once
+# PASS SQLite full restart keeps unknown/sent dedup
+# INDEPENDENT_AUDIT_PASS checks=32
+# Subtest: checks/independent-audit.integration.mjs
+ok 3 - checks/independent-audit.integration.mjs
+  ---
+  duration_ms: 1616.093351
+  type: 'test'
+  ...
+# Subtest: runtime OAuth: missing token is 401 with resource metadata challenge
+ok 10 - runtime OAuth: missing token is 401 with resource metadata challenge
+  ---
+  duration_ms: 568.542876
+  type: 'test'
+  ...
+# Subtest: runtime OAuth: protected resource discovery advertises only configured resource
+ok 11 - runtime OAuth: protected resource discovery advertises only configured resource
+  ---
+  duration_ms: 6.022188
+  type: 'test'
+  ...
+# Subtest: runtime OAuth: invalid, wrong-audience, expired and failing validator denied
+ok 12 - runtime OAuth: invalid, wrong-audience, expired and failing validator denied
+  ---
+  duration_ms: 21.936265
+  type: 'test'
+  ...
+# Subtest: runtime MCP: initialize, tool discovery and owner status succeed
+ok 13 - runtime MCP: initialize, tool discovery and owner status succeed
+  ---
+  duration_ms: 26.431321
+  type: 'test'
+  ...
+# Subtest: runtime MCP: modern protocol discovers tools without legacy initialize
+ok 14 - runtime MCP: modern protocol discovers tools without legacy initialize
+  ---
+  duration_ms: 8.458416
+  type: 'test'
+  ...
+# Subtest: runtime MCP: read-only token cannot send, other target/bot/mention rejected
+ok 15 - runtime MCP: read-only token cannot send, other target/bot/mention rejected
+  ---
+  duration_ms: 20.904477
+  type: 'test'
+  ...
+# Subtest: runtime MCP: bad browser origin rejected without wildcard CORS
+ok 16 - runtime MCP: bad browser origin rejected without wildcard CORS
+  ---
+  duration_ms: 3.824729
+  type: 'test'
+  ...
+# Subtest: runtime SQLite ledger: send once, fixed bot/private secret, dedup survives new requests
+ok 17 - runtime SQLite ledger: send once, fixed bot/private secret, dedup survives new requests
+  ---
+  duration_ms: 18.953242
+  type: 'test'
+  ...
+# Subtest: runtime SQLite ledger: changed payload cannot evade same-source dedup
+ok 18 - runtime SQLite ledger: changed payload cannot evade same-source dedup
+  ---
+  duration_ms: 7.555109
+  type: 'test'
+  ...
+# Subtest: runtime SQLite ledger: receipt survives full runtime restart and no gateway call
+ok 19 - runtime SQLite ledger: receipt survives full runtime restart and no gateway call
+  ---
+  duration_ms: 447.934279
+  type: 'test'
+  ...
+1..19
+# tests 19
+# suites 0
+# pass 19
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 14414.907246

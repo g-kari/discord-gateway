@@ -6,7 +6,7 @@
 
 1. 新規Worker `ichihime-discord-reply-mcp` の配備先アカウントとHTTPS URL。既存 `discord-gateway` は変更しない。
 2. 本人だけを認証し、MCP用resource/audienceとscopeを発行する認可サーバー。既存の承認済みサーバーが再利用できる場合も、resource/scopeや継続アクセスを追加するなら明示承認を得る。新OAuth grant・credential・Service Binding・server-side secretの作成/追加を勝手に行わない。
-3. private `AUTH_SERVER` RPC binding。`validateToken(resource, token)` は公式provider 1.2.4の形式 `{ audience, expiresAt, userId, scope, clientId, props }` を返し、userIdは認証された実本人subjectにする。ユーザー入力や表示名からsubjectを作らない。
+3. 本番は `AUTH_MODE=0g0-id-jwt`、`AUTH_SERVER_URL=https://id.0g0.xyz`。固定JWKSをjoseで検証するadapterを内蔵するため、0g0-idへのRPC bindingは追加しない。resource access tokenのraw `sub=user.id`を使う。OIDCのpairwise sub、Discord ID、別クライアントのowner-subを流用せず、最初のJWTから自動採用もしない。`service-binding` modeは明示設定時だけ有効で、別途承認された検証実装か合成fixture専用。
 4. private `GATEWAY_SERVICE` bindingの対象は既存 `discord-gateway` に限定する。コネクタは `/send` 以外を使わない。
 5. `GATEWAY_ADMIN_KEY` は既存Gateway管理キーと対応するserver-side secret。新Workerへ置くことは継続アクセスの追加になるため、対象と影響を本人に説明し、個別承認後に安全なUI/手順で設定する。値を取り出して会話、ソース、ZIP、CLI引数、ログに残さない。
 6. `OWNER_SUBJECT`、`MCP_SERVER_URL`、`AUTH_SERVER_URL` を検証済みの実値で設定する。
@@ -26,6 +26,17 @@
 
 ## 本人へまとめて確認できる最小の次手
 
-「指定するCloudflareアカウントに新返信Workerを配備し、本人認証用の限定scopeとprivate service binding、Gateway管理キーをserver-side secretとして追加して、本人が指定するguild/channelだけを許可してよいですか。これは既存Gatewayへの継続アクセスを新Workerに追加します。Botトークンは移しません。最初は送信無効で検証します。」
+「指定するCloudflareアカウントに新返信Workerを配備し、0g0-idの本人限定resource/scopeとGateway private service binding、Gateway管理キーをserver-side secretとして追加して、本人が指定するguild/channelだけを許可してよいですか。これは既存Gatewayへの継続アクセスを新Workerに追加します。Botトークンは移しません。最初は送信無効で検証します。」
 
 実アカウント、認可サーバー、scope、送り先が未確定なら先に確定し、それらを含む具体的な確認に直してください。実送信は、この構成承認とは分けて対象と本文を示して確認します。課金や契約が増える場合は、その内容を別途示してください。
+
+## 0g0-idの登録値
+
+- issuer: `https://id.0g0.xyz`
+- JWKS: `https://id.0g0.xyz/.well-known/jwks.json`（固定、Bearerなし、redirectなし）
+- resource URIとMCP_SERVER_URL: 実際に公開する正確なHTTPS `/mcp` URLを同一にする。
+- allowed_scopes: `["discord:reply:read", "discord:reply:send"]`。
+- allowed_subjects: 本人の検証済みraw user.idだけの配列。空配列はIdPでは全利用者許可なので、空で登録しない。
+- `POST https://id.0g0.xyz/api/resources` は管理者+CSRF認証の継続アクセス追加。本人の操作時承認前には実行しない。
+- DCRは既存 `/api/register` を利用する想定。ChatGPTの実登録・scope選択・OAuth同意は未検証。IdP全体のscopes_supportedにこのresource scopeが列挙されていないため、MCP側metadata/challengeから正しく要求されることを実接続で確認する。
+- 0g0-id resource access tokenをローカルJWKSで検証する方式のため、IdPの失効・利用者/scope制限変更は既発行JWTには直ちに反映されない。最大15分のtoken期限と鍵cache最大5分の制約がある。緊急停止には本WorkerのSEND_ENABLED=falseまたは入口停止を使い、無承認で権限を広げない。

@@ -1,6 +1,6 @@
 npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
 
-> ichihime-discord-reply-connector@0.1.0 build
+> ichihime-discord-reply-connector@0.2.0 build
 > esbuild src/worker.mjs --bundle --format=esm --platform=browser --conditions=workerd --external:cloudflare:* --external:node:* --outfile=dist/worker.mjs
 
 

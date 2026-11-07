@@ -29,7 +29,7 @@ let mf,persist;
 async function start(){const script=await readFile(new URL('../dist/worker.mjs',import.meta.url),'utf8');mf=new Miniflare({durableObjectsPersist:persist,workers:[{name:'synthetic-ingress',modules:true,serviceBindings:{REPLY:'reply'},script:`export default {fetch(req,env){const headers=new Headers(req.headers);headers.set('Host',new URL(req.url).host);return env.REPLY.fetch(new Request(req,{headers}));}}`},{
  name:'reply',modules:true,script,compatibilityDate:'2026-07-30',compatibilityFlags:['nodejs_compat','global_fetch_strictly_public'],
  durableObjects:{REPLY_LEDGER:{className:'ReplyLedger',useSQLite:true}},
- bindings:{OWNER_SUBJECT:OWNER,ALLOWED_TARGETS_JSON:JSON.stringify([{guild_id:G,channel_id:C,type:0}]),SEND_ENABLED:'true',GATEWAY_ADMIN_KEY:'synthetic-key-not-a-credential',MCP_SERVER_URL:ORIGIN+'/mcp',AUTH_SERVER_URL:'https://auth.test'},
+ bindings:{AUTH_MODE:'service-binding',OWNER_SUBJECT:OWNER,ALLOWED_TARGETS_JSON:JSON.stringify([{guild_id:G,channel_id:C,type:0}]),SEND_ENABLED:'true',GATEWAY_ADMIN_KEY:'synthetic-key-not-a-credential',MCP_SERVER_URL:ORIGIN+'/mcp',AUTH_SERVER_URL:'https://auth.test'},
  serviceBindings:{AUTH_SERVER:'synthetic-auth',GATEWAY_SERVICE:'synthetic-gateway'},outboundService:()=>new Response('Outbound networking is disabled',{status:500})
 },{name:'synthetic-auth',modules:true,script:authScript},{name:'synthetic-gateway',modules:true,script:gatewayScript}]});await mf.ready;}
 before(async()=>{persist=await mkdtemp(join(tmpdir(),'ichihime-reply-test-'));await start();});

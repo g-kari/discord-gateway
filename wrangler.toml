@@ -1,0 +1,26 @@
+# discord-gateway — reference configuration.
+# Deploy from gizen with wrangler, like dots-kick-events. No custom domain
+# or workers.dev route is configured yet (workers_dev stays off).
+name = "discord-gateway"
+main = "worker.js"
+compatibility_date = "2025-11-01"
+workers_dev = false
+
+[[durable_objects.bindings]]
+name = "GATEWAY"
+class_name = "Gateway"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Gateway"]
+
+# Secrets (set with `wrangler secret put` — never write values here):
+#   DISCORD_BOT_TOKEN   Discord bot token (Bot authorization)
+#   CLAUDE_HOOK_SECRET  whsec_ HMAC secret shared with dots-events'
+#                       POST /claude-hook receiver
+#   ADMIN_KEY           admin key for POST /connect and POST /send
+#
+# Endpoints (once routed/deployed):
+#   GET  /status   public: {"connected": bool, "ready": bool} only
+#   POST /connect  admin key: nudge the Durable Object to (re)connect
+#   POST /send     admin key: post a message to a Discord channel

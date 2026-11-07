@@ -1,3 +1,7 @@
+# Shared connection support (unactivated)
+
+The additive `src/shared-worker.mjs` entrypoint binds verified OAuth client IDs to server-fixed Bot/target policies. It preserves the dedicated v0.2 entrypoint unchanged. Read [the design and migration plan](docs/shared-reply-design.md) before any activation. Build with `npm run build:shared`; run the same unit/integration suite. No production migration, OAuth registration or send is included.
+
 # 一姫 Discord返信コネクタ
 
 本人専用の認証付きMCPコネクタのソースです。既存 `g-kari/discord-gateway` の `POST /send` に、一姫固定で1通だけ渡します。既存Gateway、Botトークン、接続、権限、デプロイには変更を加えません。

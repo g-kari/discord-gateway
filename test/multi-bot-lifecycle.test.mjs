@@ -141,7 +141,7 @@ test("two sockets: the same mention is forwarded once per bot to its own target"
   const event = JSON.stringify({ op: 0, s: 2, t: "MESSAGE_CREATE", d: {
     id: "shared-message", channel_id: "123", guild_id: "456",
     content: "<@999> <@888> hello", mentions: [{ id: "999" }, { id: "888" }],
-    author: { id: "111", username: "test" },
+    author: { id: "333933401314951168", username: "test" },
   } });
   for (const bot of ["croissand", "ichihime"]) await control(bot, "event", event);
   await stub.fetch("https://local/test/alarm");

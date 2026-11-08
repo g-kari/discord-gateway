@@ -110,8 +110,11 @@ test("filter: DMs are forwarded, with the header line and request_id", () => {
   );
 });
 
+const OWNER_ID = "333933401314951168";
+
 test("filter: guild messages mentioning the bot are forwarded, mention stripped", () => {
   const m = message({
+    author: { id: OWNER_ID, username: "g_kari", bot: false },
     content: `<@${BOT_ID}> please check this`,
     mentions: [{ id: BOT_ID, username: "gateway-bot" }],
   });
@@ -120,13 +123,45 @@ test("filter: guild messages mentioning the bot are forwarded, mention stripped"
   assert.ok(req);
   assert.equal(
     req.text,
-    "[discord channel:222333444555666777 guild:333444555666777888 author:alice]\nplease check this"
+    "[discord channel:222333444555666777 guild:333444555666777888 author:g_kari]\nplease check this"
   );
   // The <@!id> nickname-mention form is recognized and stripped too.
-  const m2 = message({ content: `<@!${BOT_ID}> ping` });
+  const m2 = message({
+    author: { id: OWNER_ID, username: "g_kari", bot: false },
+    content: `<@!${BOT_ID}> ping`,
+  });
   const req2 = pure.buildForwardRequest(m2, BOT_ID);
   assert.ok(req2);
   assert.ok(req2.text.endsWith("]\nping"));
+});
+
+test("filter: the owner's plain guild messages are forwarded without a mention", () => {
+  const m = message({
+    author: { id: OWNER_ID, username: "g_kari", bot: false },
+    content: "no mention needed",
+  });
+  assert.equal(pure.shouldForwardMessage(m, BOT_ID), true);
+  const req = pure.buildForwardRequest(m, BOT_ID);
+  assert.ok(req);
+  assert.ok(req.text.endsWith("]\nno mention needed"));
+});
+
+test("filter: other members' guild messages are ignored even with a mention", () => {
+  const m = message({
+    content: `<@${BOT_ID}> please check this`,
+    mentions: [{ id: BOT_ID, username: "gateway-bot" }],
+  });
+  assert.equal(pure.shouldForwardMessage(m, BOT_ID), false);
+  assert.equal(pure.buildForwardRequest(m, BOT_ID), null);
+});
+
+test("filter: trusted bots mentioning the bot are forwarded", () => {
+  const m = message({
+    author: { id: "1568548424519913482", username: "kazami-ichihime", bot: true },
+    content: `<@${BOT_ID}> handoff`,
+    mentions: [{ id: BOT_ID, username: "gateway-bot" }],
+  });
+  assert.equal(pure.shouldForwardMessage(m, BOT_ID), true);
 });
 
 test("filter: plain guild messages without a mention are ignored", () => {

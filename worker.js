@@ -66,6 +66,8 @@
 //   POST /send     admin key; {"channel_id", "content", "bot"?} ->
 //                  Discord REST, sent as the selected bot
 //                  ("croissand" by default)
+//   POST /reply-source admin key; verify a short-lived owner source
+//                  observed by ichihime's Gateway connection
 //   POST /avatar   admin key; {"image_base64" | "image_url", "bot"?} ->
 //                  PATCH the selected bot's avatar via Discord REST
 
@@ -231,6 +233,7 @@ export async function verifyBody(secret, msgId, timestampSec, body, signatureHea
 // 2026-11-09: a mention is required). Owner DMs keep their existing
 // routing: a DM reaches the bot it was sent to.
 const OWNER_USER_ID = "333933401314951168";
+const ICHIHIME_USER_ID = "1568548424519913482";
 
 // Bot authors are forwarded only when they mention the receiving
 // bot, so the bots in the owner's servers can hand messages to each
@@ -240,6 +243,9 @@ const OWNER_USER_ID = "333933401314951168";
 function mentionsBot(message, botUserId) {
   if (!botUserId) return false;
   const mentions = Array.isArray(message.mentions) ? message.mentions : [];
+  // For ichihime, only Discord's actual mention metadata is evidence.
+  // A name or literal/quoted mention token cannot authorize a reply.
+  if (botUserId === ICHIHIME_USER_ID) return mentions.some((m) => m && m.id === botUserId);
   if (mentions.length > 0) return mentions.some((m) => m && m.id === botUserId);
   return new RegExp(`<@!?${botUserId}>`).test(message.content);
 }
@@ -303,6 +309,73 @@ export function buildForwardRequest(message, botUserId) {
     `[discord channel:${message.channel_id} guild:${guild} author:${username}]\n` +
     content;
   return { text, topic: "discord", request_id: `discord-${message.id}` };
+}
+
+// Automatic replies have a narrower source boundary than forwarding.
+// Never trust a caller-supplied author: only an observed Gateway event
+// can create a source. The ledger stores a digest, never another copy
+// of the message text or username.
+const REPLY_SOURCE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const REPLY_SOURCE_MAX_FUTURE_MS = 5 * 60 * 1000;
+
+function discordSnowflakeTime(id) {
+  if (typeof id !== "string" || !/^[1-9]\d{0,19}$/.test(id)) return null;
+  const value = BigInt(id);
+  if (value > 0xffffffffffffffffn) return null;
+  return Number(value >> 22n) + 1420070400000;
+}
+
+function autoReplyTarget(env) {
+  if (typeof env?.AUTO_REPLY_TARGET_JSON !== "string") return null;
+  let target;
+  try { target = JSON.parse(env.AUTO_REPLY_TARGET_JSON); }
+  catch (_) { return null; }
+  if (!target || typeof target !== "object" || Array.isArray(target) ||
+      Object.keys(target).length !== 3 || !Object.hasOwn(target, "guild_id") ||
+      !Object.hasOwn(target, "channel_id") || !Object.hasOwn(target, "type") ||
+      target.type !== 0 || discordSnowflakeTime(target.guild_id) === null ||
+      discordSnowflakeTime(target.channel_id) === null) return null;
+  return target;
+}
+
+function replyContext(message) {
+  // Missing metadata is not evidence of no addressee when Discord marks
+  // the message as a reply/forward or supplies part of a reference.
+  if (Object.hasOwn(message, "message_snapshots")) return "unknown";
+  if (!Object.hasOwn(message, "message_reference")) {
+    return Object.hasOwn(message, "referenced_message") ||
+      (message.type !== undefined && message.type !== 0) ? "unknown" : "none";
+  }
+  if (message.type !== undefined && message.type !== 19) return "unknown";
+  const reference = message.message_reference;
+  const referenced = message.referenced_message;
+  if (!reference || typeof reference !== "object" || Array.isArray(reference) ||
+      (reference.type !== undefined && reference.type !== 0) ||
+      reference.channel_id !== message.channel_id ||
+      (reference.guild_id !== undefined && reference.guild_id !== message.guild_id) ||
+      discordSnowflakeTime(reference.message_id) === null ||
+      !referenced || typeof referenced !== "object" || Array.isArray(referenced) ||
+      referenced.id !== reference.message_id || referenced.channel_id !== message.channel_id ||
+      (referenced.guild_id !== undefined && referenced.guild_id !== message.guild_id) ||
+      discordSnowflakeTime(referenced.author?.id) === null) return "unknown";
+  return referenced.author.id === ICHIHIME_USER_ID ? "self" : "other";
+}
+
+function validReplySourceInput(body, includeBot = true) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  const keys = ["source_message_id", "guild_id", "channel_id", "source_text_sha256"];
+  if (includeBot) keys.push("bot");
+  if (Object.keys(body).length !== keys.length || keys.some((key) => !Object.hasOwn(body, key))) return false;
+  return (!includeBot || body.bot === "ichihime") &&
+    discordSnowflakeTime(body.source_message_id) !== null &&
+    discordSnowflakeTime(body.guild_id) !== null &&
+    discordSnowflakeTime(body.channel_id) !== null &&
+    typeof body.source_text_sha256 === "string" && /^[a-f0-9]{64}$/.test(body.source_text_sha256);
+}
+
+async function sha256Text(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 // ---------- forward delivery modes ----------
@@ -868,6 +941,19 @@ export class Gateway extends DurableObject {
         "request_id TEXT NOT NULL, completed_at INTEGER NOT NULL, " +
         "PRIMARY KEY (bot, request_id))"
     );
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS reply_sources (" +
+        "source_message_id TEXT PRIMARY KEY, bot TEXT NOT NULL, bot_user_id TEXT NOT NULL, " +
+        "guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, owner_verified INTEGER NOT NULL, " +
+        "self_mentioned INTEGER NOT NULL DEFAULT 0, " +
+        "source_text_sha256 TEXT, reply_context TEXT NOT NULL, " +
+        "created_at_ms INTEGER NOT NULL, received_at_ms INTEGER NOT NULL, " +
+        "expires_at_ms INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)"
+    );
+    this.migrateReplySourceMentions();
+    this.ctx.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS reply_sources_expiry ON reply_sources (expires_at_ms)"
+    );
     this.migrateStorage();
     // Self-start: if any bot is configured and no alarm is pending,
     // arrange a watchdog wake-up so a configured-but-disconnected
@@ -896,6 +982,16 @@ export class Gateway extends DurableObject {
     // Keep both table rebuilds atomic, including a failure between DROP
     // and RENAME. A retry must see the old rows, never an empty new table.
     this.ctx.storage.transactionSync(() => this.migrateBotTables());
+  }
+
+  migrateReplySourceMentions() {
+    // Old sources contain no evidence of a real self mention. Add the
+    // column in place, preserving their data but leaving them ineligible.
+    // The idempotent schema check also makes a constructor retry safe.
+    const columns = this.ctx.storage.sql.exec("PRAGMA table_info(reply_sources)").toArray();
+    if (!columns.some((column) => column.name === "self_mentioned")) {
+      this.ctx.storage.sql.exec("ALTER TABLE reply_sources ADD COLUMN self_mentioned INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   migrateBotTables() {
@@ -1095,6 +1191,34 @@ export class Gateway extends DurableObject {
 
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/internal/reply-source" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!validReplySourceInput(body)) return jsonResponse({ error: "invalid reply source" }, 400);
+      return this.runLocked(() => jsonResponse(this.verifyReplySource(body)));
+    }
+    if (url.pathname === "/internal/reply-send" && request.method === "POST") {
+      const body = await request.json().catch(() => null);
+      if (!body || body.bot !== "ichihime" || !validReplySourceInput(body.reply_source, false) ||
+          typeof body.content !== "string" || !body.content.trim() || body.content.length > 2000) {
+        return jsonResponse({ error: "invalid reply source" }, 400);
+      }
+      // Validate and START the POST in the same lock turn as source
+      // revocations. Release the lock before waiting for the network,
+      // so edits/deletes can revoke the next chunk or a 429 retry.
+      // A POST already started cannot be recalled by a later event.
+      const result = await this.runLocked(() => {
+        const source = { ...body.reply_source, bot: body.bot };
+        const proof = this.verifyReplySource(source);
+        if (body.channel_id !== source.channel_id || !proof.verified ||
+            !["none", "self"].includes(proof.reply_context)) {
+          return { response: jsonResponse({ error: "reply source not verified" }, 403) };
+        }
+        const token = this.env[BOT_CONFIGS.ichihime.tokenEnv];
+        if (!token) return { response: jsonResponse({ error: "discord bot not configured" }, 500) };
+        return { pending: postDiscordMessage(token, body.channel_id, body.content) };
+      });
+      return result.response || result.pending;
+    }
     if (url.pathname === "/internal/status" && request.method === "GET") {
       return this.runLocked(async () => {
         const bots = {};
@@ -1305,11 +1429,13 @@ export class Gateway extends DurableObject {
         return;
       }
       const state = this.loadState(botKey);
+      const receivedAt = Date.now();
       const { state: nextState, actions } = handleGatewayPayload(state, payload, {
-        now: Date.now(),
+        now: receivedAt,
       });
       if (!actions.some(action => action.type === "close_socket")) nextState.connected = true;
       this.saveState(nextState, botKey);
+      await this.recordReplySourceEvent(botKey, state.botUserId, payload, actions, receivedAt);
       await this.executeGatewayActions(botKey, ws, nextState, actions);
       await this.scheduleAlarmLocked();
     });
@@ -1516,6 +1642,94 @@ export class Gateway extends DurableObject {
         this.saveState(next, botKey);
       }
     }
+  }
+
+  // --- automatic-reply source ledger (SQLite, separate from outbox) ---
+
+  cleanupReplySources(now = Date.now()) {
+    this.ctx.storage.sql.exec("DELETE FROM reply_sources WHERE expires_at_ms <= ?", now);
+  }
+
+  async recordReplySourceEvent(botKey, botUserId, payload, actions, now = Date.now()) {
+    if (botKey !== "ichihime" || botUserId !== ICHIHIME_USER_ID || payload.op !== 0) return;
+    const target = autoReplyTarget(this.env);
+    if (!target) return;
+    const message = payload.d;
+    if (!message || message.channel_id !== target.channel_id ||
+        (message.channel_type !== undefined && message.channel_type !== 0) ||
+        (message.guild_id !== undefined && message.guild_id !== target.guild_id)) return;
+
+    const revokedEvent = ["MESSAGE_UPDATE", "MESSAGE_DELETE", "MESSAGE_DELETE_BULK"].includes(payload.t);
+    if (payload.t !== "MESSAGE_CREATE" && !revokedEvent) return;
+    this.cleanupReplySources(now);
+    if (revokedEvent) {
+      const ids = payload.t === "MESSAGE_DELETE_BULK" ? message.ids : [message.id];
+      if (!Array.isArray(ids)) return;
+      for (const id of ids) {
+        const createdAt = discordSnowflakeTime(id);
+        if (createdAt === null || createdAt + REPLY_SOURCE_MAX_AGE_MS <= now) continue;
+        // A tombstone also blocks an out-of-order or replayed CREATE.
+        // Do not replace its first receipt time or extend its lifetime.
+        this.ctx.storage.sql.exec(
+          "INSERT INTO reply_sources " +
+            "(source_message_id, bot, bot_user_id, guild_id, channel_id, owner_verified, self_mentioned, " +
+            "source_text_sha256, reply_context, created_at_ms, received_at_ms, expires_at_ms, revoked) " +
+            "VALUES (?, 'ichihime', ?, ?, ?, 0, 0, NULL, 'unknown', ?, ?, ?, 1) " +
+            "ON CONFLICT (source_message_id) DO UPDATE SET revoked = 1",
+          id, ICHIHIME_USER_ID, target.guild_id, target.channel_id,
+          createdAt, now, createdAt + REPLY_SOURCE_MAX_AGE_MS
+        );
+      }
+      return;
+    }
+
+    if (message.guild_id !== target.guild_id || message.author?.id !== OWNER_USER_ID ||
+        message.author.bot || message.webhook_id ||
+        !Array.isArray(message.mentions) || !message.mentions.some((mention) => mention?.id === ICHIHIME_USER_ID) ||
+        (message.type !== undefined && ![0, 19].includes(message.type))) return;
+    // Use the exact request emitted by the existing forwarding filter.
+    const request = actions.find((action) => action.type === "forward")?.request;
+    const createdAt = discordSnowflakeTime(message.id);
+    if (!request || request.request_id !== `discord-${message.id}` ||
+        createdAt === null || createdAt >= now + REPLY_SOURCE_MAX_FUTURE_MS ||
+        createdAt + REPLY_SOURCE_MAX_AGE_MS <= now) return;
+    const digest = await sha256Text(request.text);
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO reply_sources " +
+        "(source_message_id, bot, bot_user_id, guild_id, channel_id, owner_verified, self_mentioned, " +
+        "source_text_sha256, reply_context, created_at_ms, received_at_ms, expires_at_ms, revoked) " +
+        "VALUES (?, 'ichihime', ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, 0)",
+      message.id, ICHIHIME_USER_ID, target.guild_id, target.channel_id,
+      digest, replyContext(message), createdAt, now, createdAt + REPLY_SOURCE_MAX_AGE_MS
+    );
+  }
+
+  verifyReplySource(body, now = Date.now()) {
+    this.cleanupReplySources(now);
+    const target = autoReplyTarget(this.env);
+    if (!target || !validReplySourceInput(body) || body.guild_id !== target.guild_id ||
+        body.channel_id !== target.channel_id) return { verified: false };
+    const row = this.ctx.storage.sql.exec(
+      "SELECT * FROM reply_sources WHERE source_message_id = ?", body.source_message_id
+    ).toArray()[0];
+    const createdAt = discordSnowflakeTime(body.source_message_id);
+    if (!row || row.revoked !== 0 || row.owner_verified !== 1 || row.self_mentioned !== 1 || row.bot !== "ichihime" ||
+        row.bot_user_id !== ICHIHIME_USER_ID || row.guild_id !== body.guild_id ||
+        row.channel_id !== body.channel_id || row.source_text_sha256 !== body.source_text_sha256 ||
+        !["none", "self", "other", "unknown"].includes(row.reply_context) ||
+        row.created_at_ms !== createdAt || createdAt >= now + REPLY_SOURCE_MAX_FUTURE_MS ||
+        row.expires_at_ms !== createdAt + REPLY_SOURCE_MAX_AGE_MS || row.expires_at_ms <= now ||
+        !Number.isSafeInteger(row.received_at_ms) || row.received_at_ms > now ||
+        createdAt >= row.received_at_ms + REPLY_SOURCE_MAX_FUTURE_MS ||
+        row.received_at_ms >= row.expires_at_ms) return { verified: false };
+    return {
+      verified: true, source_message_id: row.source_message_id,
+      guild_id: row.guild_id, channel_id: row.channel_id, bot: row.bot,
+      owner_verified: true, self_mentioned: true, source_text_sha256: row.source_text_sha256,
+      reply_context: row.reply_context,
+      created_at_ms: row.created_at_ms, received_at_ms: row.received_at_ms,
+      expires_at_ms: row.expires_at_ms,
+    };
   }
 
   // --- forwarding outbox (SQLite) ---
@@ -1944,6 +2158,27 @@ function gatewayStub(env) {
   return env.GATEWAY.get(env.GATEWAY.idFromName("global"));
 }
 
+async function handleReplySource(env, request) {
+  if (!isAdminKey(env, request)) return jsonResponse({ error: "unauthorized" }, 401);
+  const body = await request.json().catch(() => null);
+  if (!validReplySourceInput(body)) return jsonResponse({ error: "invalid reply source" }, 400);
+  const response = await gatewayStub(env).fetch("https://gateway/internal/reply-source", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  return new Response(response.body, {
+    status: response.status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+  });
+}
+
+function postDiscordMessage(token, channelId, content) {
+  return fetch(`${DISCORD_API_BASE}/channels/${channelId}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bot ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ content, allowed_mentions: { parse: [] } }),
+    redirect: "manual",
+  });
+}
+
 async function handleSend(env, request) {
   if (!isAdminKey(env, request)) {
     return jsonResponse({ error: "unauthorized" }, 401);
@@ -1967,6 +2202,11 @@ async function handleSend(env, request) {
   if (!rawContent.trim()) {
     return jsonResponse({ error: "content is required" }, 400);
   }
+  const guarded = Object.hasOwn(body, "reply_source");
+  if (guarded && (!validReplySourceInput(body.reply_source, false) || botKey !== "ichihime" ||
+      body.reply_source.channel_id !== channelId)) {
+    return jsonResponse({ error: "invalid reply source" }, 400);
+  }
   const botToken = env[BOT_CONFIGS[botKey].tokenEnv];
   if (!botToken) {
     return jsonResponse({ error: "discord bot not configured" }, 500);
@@ -1982,18 +2222,12 @@ async function handleSend(env, request) {
     // Per-chunk delivery with bounded 429 handling: wait Discord's
     // retry_after (capped) and re-try the same chunk, up to 3 tries.
     for (let attempt = 0; attempt < 3; attempt++) {
-      res = await fetch(
-        `${DISCORD_API_BASE}/channels/${channelId}/messages`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bot ${botToken}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ content: chunks[i], allowed_mentions: { parse: [] } }),
-          redirect: "manual",
-        }
-      );
+      res = guarded
+        ? await gatewayStub(env).fetch("https://gateway/internal/reply-send", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ bot: botKey, channel_id: channelId, content: chunks[i], reply_source: body.reply_source }),
+        })
+        : await postDiscordMessage(botToken, channelId, chunks[i]);
       text = await res.text();
       if (res.status !== 429 || attempt === 2) break;
       let parsed = null;
@@ -2121,6 +2355,9 @@ export default {
       }
       if (url.pathname === "/send" && request.method === "POST") {
         return handleSend(env, request);
+      }
+      if (url.pathname === "/reply-source" && request.method === "POST") {
+        return handleReplySource(env, request);
       }
       if (url.pathname === "/avatar" && request.method === "POST") {
         return handleAvatar(env, request);

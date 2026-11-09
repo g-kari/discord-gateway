@@ -237,15 +237,25 @@ test("filter: ichihime does not treat a quoted self ID as a real self mention", 
   assert.equal(pure.buildForwardRequest(m, ICHIHIME_ID), null);
 });
 
-test("filter: mention detection falls back to content only when the mentions list is empty or missing", () => {
+test("filter: ichihime never falls back to content for absent or empty mention metadata", () => {
   const owner = { id: OWNER_ID };
   const common = { author: owner, mentions: [], mention_roles: [], mention_everyone: false };
   assert.equal(pure.shouldForwardMessage(message({ ...common, content: "contact@here.example", mention_everyone: undefined }), ICHIHIME_ID), false);
   assert.equal(pure.shouldForwardMessage(message({ ...common, content: "@everyone hello", mention_everyone: undefined }), ICHIHIME_ID), false);
   assert.equal(pure.shouldForwardMessage(message({ ...common, content: "<@123456789012345678> hello", mentions: undefined }), ICHIHIME_ID), false);
   assert.equal(pure.shouldForwardMessage(message({ ...common, content: "<@&123456789012345678> hello", mention_roles: undefined }), ICHIHIME_ID), false);
-  assert.equal(pure.shouldForwardMessage(message({ ...common, content: `<@${ICHIHIME_ID}> hello`, mentions: undefined }), ICHIHIME_ID), true);
-  assert.equal(pure.shouldForwardMessage(message({ ...common, content: `<@${ICHIHIME_ID}> hello` }), ICHIHIME_ID), true);
+  for (const mentions of [undefined, null, [], {}, [{ id: "123456789012345678" }]]) {
+    for (const content of [`<@${ICHIHIME_ID}> hello`, `<@!${ICHIHIME_ID}> hello`, `\`<@${ICHIHIME_ID}>\` is syntax`]) {
+      const m = message({ ...common, content, mentions });
+      assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false);
+      assert.equal(pure.buildForwardRequest(m, ICHIHIME_ID), null);
+    }
+  }
+  // Croissand's newly merged upstream fallback remains unchanged.
+  for (const mentions of [undefined, []]) {
+    assert.equal(pure.shouldForwardMessage(message({ ...common, content: `<@${CROISSAND_ID}> hello`, mentions }), CROISSAND_ID), true);
+  }
+  assert.equal(pure.shouldForwardMessage(message({ ...common, content: `<@${CROISSAND_ID}> hello`, mentions: [{ id: ICHIHIME_ID }] }), CROISSAND_ID), false);
 });
 
 test("filter: ichihime's own mention forwards an owner message even alongside other mentions; her name alone does not", () => {
@@ -285,6 +295,10 @@ test("filter: ichihime's owner rule does not widen bot, other member or webhook 
   }
   const m = message({ author: { id: CROISSAND_ID, bot: true }, content: `<@${ICHIHIME_ID}> hi`, mentions: [{ id: ICHIHIME_ID }] });
   assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true);
+  for (const mentions of [undefined, [], null]) {
+    assert.equal(pure.shouldForwardMessage({ ...m, mentions }, ICHIHIME_ID), false);
+  }
+  assert.equal(pure.shouldForwardMessage({ ...m, author: { id: "123456789012345678", bot: false } }, ICHIHIME_ID), false);
   assert.equal(pure.shouldForwardMessage({ ...m, author: { id: ICHIHIME_ID, bot: true } }, ICHIHIME_ID), false);
   assert.equal(pure.shouldForwardMessage({ ...m, webhook_id: "123456789012345678" }, ICHIHIME_ID), false);
 });
@@ -315,6 +329,11 @@ test("filter: the owner's DM reaches the bot even when it names the other bot", 
     content: "一姫の様子どう？",
   });
   assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), true);
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true);
+  assert.ok(pure.buildForwardRequest(m, ICHIHIME_ID));
+  const humanDm = { ...m, author: { id: "123456789012345678", bot: false } };
+  assert.equal(pure.shouldForwardMessage(humanDm, ICHIHIME_ID), true);
+  assert.ok(pure.buildForwardRequest(humanDm, ICHIHIME_ID));
 });
 
 test("filter: other members' guild messages are ignored even with a mention", () => {

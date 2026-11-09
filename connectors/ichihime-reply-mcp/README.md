@@ -1,5 +1,11 @@
 # Shared connection support (unactivated)
 
+The additive automatic-reply path is documented in
+[Verified automatic replies](docs/automatic-replies.md). It verifies the exact
+owner-authored source, recipient context and activation boundary before using
+the existing connection and permanent send ledger. Its implementation does not
+by itself enable production sending or change OAuth grants.
+
 The additive `src/shared-worker.mjs` entrypoint binds verified OAuth client IDs to server-fixed Bot/target policies. It preserves the dedicated v0.2 entrypoint unchanged. Read [the design and migration plan](docs/shared-reply-design.md) before any activation. Build with `npm run build:shared`; run the same unit/integration suite. No production migration, OAuth registration or send is included.
 
 # 一姫 Discord返信コネクタ

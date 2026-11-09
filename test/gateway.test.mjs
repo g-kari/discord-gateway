@@ -143,15 +143,15 @@ test("filter: guild messages mentioning the bot are forwarded, mention stripped"
   assert.ok(req2.text.endsWith("]\nping"));
 });
 
-test("filter: the owner's plain guild messages are forwarded without a mention", () => {
+test("filter: the owner's plain guild messages are not forwarded without a mention", () => {
   const m = message({
     author: { id: OWNER_ID, username: "g_kari", bot: false },
     content: "no mention needed",
   });
-  assert.equal(pure.shouldForwardMessage(m, BOT_ID), true);
-  const req = pure.buildForwardRequest(m, BOT_ID);
-  assert.ok(req);
-  assert.ok(req.text.endsWith("]\nno mention needed"));
+  assert.equal(pure.shouldForwardMessage(m, BOT_ID), false);
+  assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), false);
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false);
+  assert.equal(pure.buildForwardRequest(m, BOT_ID), null);
 });
 
 const CROISSAND_ID = "1568508479293890673";
@@ -167,38 +167,39 @@ test("filter: the owner's guild message mentioning the other bot goes only to th
   assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true);
 });
 
-test("filter: the owner's guild message naming the other bot goes only to that bot", () => {
+test("filter: the owner's guild message naming the other bot is not forwarded without a mention", () => {
   const m = message({
     author: { id: OWNER_ID, username: "g_kari", bot: false },
     content: "一姫さんこんにちは皆様に挨拶なさい",
   });
   assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), false);
-  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true);
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false);
 });
 
-test("filter: naming croissand without a mention also reaches ichihime", () => {
+test("filter: naming croissand without a mention reaches neither bot", () => {
   const m = message({
     author: { id: OWNER_ID, username: "g_kari", bot: false },
     content: "クロワッサンド、これ見て",
   });
-  assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), true);
-  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true);
+  assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), false);
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false);
 });
 
-test("filter: naming Hermes without a mention reaches ichihime without changing croissand", () => {
+test("filter: naming Hermes without a mention reaches neither bot", () => {
   const m = message({
     author: { id: OWNER_ID, username: "g_kari", bot: false },
     content: "ヘルメス！ダッシュボード立てて",
   });
   assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), false);
-  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true);
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false);
 });
 
-test("filter: ichihime accepts owner text without actual mentions, including other agent names", () => {
+test("filter: owner text without an actual mention is forwarded to neither bot", () => {
   for (const content of ["こんにちは", "Hermesの設定を調べて", "ヘルメスの状態は？", "クロワッサンドの記事を見て"]) {
     const m = message({ author: { id: OWNER_ID }, content });
-    assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true, content);
-    assert.ok(pure.buildForwardRequest(m, ICHIHIME_ID), content);
+    assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false, content);
+    assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), false, content);
+    assert.equal(pure.buildForwardRequest(m, ICHIHIME_ID), null, content);
   }
 });
 
@@ -222,11 +223,11 @@ test("filter: ichihime excludes owner messages with only other user, role or bro
   }
 });
 
-test("filter: ichihime respects explicit empty mention metadata for plain or quoted text", () => {
+test("filter: plain or quoted text with explicit empty mention metadata is not forwarded", () => {
   for (const content of ["contact@here.example", "`@everyone` の使い方", "```\n@here\n```", "`<@123456789012345678>` は記法です", "`<@&123456789012345678>` はロール記法です"]) {
     const m = message({ author: { id: OWNER_ID }, content, mentions: [], mention_roles: [], mention_everyone: false });
-    assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true, content);
-    assert.ok(pure.buildForwardRequest(m, ICHIHIME_ID), content);
+    assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false, content);
+    assert.equal(pure.buildForwardRequest(m, ICHIHIME_ID), null, content);
   }
 });
 
@@ -236,33 +237,42 @@ test("filter: ichihime does not treat a quoted self ID as a real self mention", 
   assert.equal(pure.buildForwardRequest(m, ICHIHIME_ID), null);
 });
 
-test("filter: ichihime uses content fallback only for missing mention metadata", () => {
+test("filter: mention detection falls back to content only when the mentions list is empty or missing", () => {
   const owner = { id: OWNER_ID };
   const common = { author: owner, mentions: [], mention_roles: [], mention_everyone: false };
-  assert.equal(pure.shouldForwardMessage(message({ ...common, content: "contact@here.example", mention_everyone: undefined }), ICHIHIME_ID), true);
+  assert.equal(pure.shouldForwardMessage(message({ ...common, content: "contact@here.example", mention_everyone: undefined }), ICHIHIME_ID), false);
   assert.equal(pure.shouldForwardMessage(message({ ...common, content: "@everyone hello", mention_everyone: undefined }), ICHIHIME_ID), false);
   assert.equal(pure.shouldForwardMessage(message({ ...common, content: "<@123456789012345678> hello", mentions: undefined }), ICHIHIME_ID), false);
   assert.equal(pure.shouldForwardMessage(message({ ...common, content: "<@&123456789012345678> hello", mention_roles: undefined }), ICHIHIME_ID), false);
   assert.equal(pure.shouldForwardMessage(message({ ...common, content: `<@${ICHIHIME_ID}> hello`, mentions: undefined }), ICHIHIME_ID), true);
+  assert.equal(pure.shouldForwardMessage(message({ ...common, content: `<@${ICHIHIME_ID}> hello` }), ICHIHIME_ID), true);
 });
 
-test("filter: ichihime's mention or name overrides other mentions for owner messages", () => {
-  for (const own of [`<@${ICHIHIME_ID}>`, `<@!${ICHIHIME_ID}>`, "一姫", "風見一姫"]) {
+test("filter: ichihime's own mention forwards an owner message even alongside other mentions; her name alone does not", () => {
+  for (const own of [`<@${ICHIHIME_ID}>`, `<@!${ICHIHIME_ID}>`]) {
     for (const other of [`<@${CROISSAND_ID}>`, "<@&123456789012345678>", "@everyone", "@here"]) {
-      const mentions = [{ id: CROISSAND_ID }];
-      if (own.startsWith("<@")) mentions.push({ id: ICHIHIME_ID });
+      const mentions = [{ id: CROISSAND_ID }, { id: ICHIHIME_ID }];
       const m = message({ author: { id: OWNER_ID }, content: `${other} ${own} こんにちは`, mentions, mention_everyone: true });
       assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true, m.content);
       assert.ok(pure.buildForwardRequest(m, ICHIHIME_ID), m.content);
     }
   }
+  for (const name of ["一姫", "風見一姫"]) {
+    const m = message({ author: { id: OWNER_ID }, content: `${name}、こんにちは`, mentions: [], mention_roles: [], mention_everyone: false });
+    assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false, m.content);
+    assert.equal(pure.buildForwardRequest(m, ICHIHIME_ID), null, m.content);
+  }
 });
 
-test("filter: accepted owner mention-only and whitespace-only messages produce no request", () => {
-  for (const content of [`<@${ICHIHIME_ID}>`, `  <@!${ICHIHIME_ID}> \n\t`, " \n\t", ""]) {
-    const mentions = content.includes("<@") ? [{ id: ICHIHIME_ID }] : [];
-    const m = message({ author: { id: OWNER_ID }, content, mentions, mention_roles: [], mention_everyone: false });
+test("filter: owner mention-only messages forward but produce no request; unmentioned whitespace produces neither", () => {
+  for (const content of [`<@${ICHIHIME_ID}>`, `  <@!${ICHIHIME_ID}> \n\t`]) {
+    const m = message({ author: { id: OWNER_ID }, content, mentions: [{ id: ICHIHIME_ID }], mention_roles: [], mention_everyone: false });
     assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true, JSON.stringify(content));
+    assert.equal(pure.buildForwardRequest(m, ICHIHIME_ID), null, JSON.stringify(content));
+  }
+  for (const content of [" \n\t", ""]) {
+    const m = message({ author: { id: OWNER_ID }, content, mentions: [], mention_roles: [], mention_everyone: false });
+    assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false, JSON.stringify(content));
     assert.equal(pure.buildForwardRequest(m, ICHIHIME_ID), null, JSON.stringify(content));
   }
 });
@@ -289,13 +299,13 @@ test("filter: the owner's guild message with a role mention is not forwarded", (
   assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false);
 });
 
-test("filter: the owner's unaddressed guild message reaches both bots", () => {
+test("filter: the owner's unaddressed guild message reaches neither bot", () => {
   const m = message({
     author: { id: OWNER_ID, username: "g_kari", bot: false },
     content: "ダッシュボード立てて",
   });
-  assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), true);
-  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true);
+  assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), false);
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false);
 });
 
 test("filter: the owner's DM reaches the bot even when it names the other bot", () => {

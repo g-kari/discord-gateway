@@ -52,12 +52,13 @@ export async function connectionIdentity(reply, row) {
 export function assertSendingEnabled(row, env) {
   if (env.SEND_ENABLED !== 'true' || row.enabled !== true || typeof env.GATEWAY_ADMIN_KEY !== 'string' || !env.GATEWAY_ADMIN_KEY || !env.GATEWAY_SERVICE || typeof env.GATEWAY_SERVICE.fetch !== 'function') fail('send_not_enabled');
 }
-export async function deliverConnection(reply, row, env) {
+export async function deliverConnection(reply, row, env, replySource) {
   assertSendingEnabled(row, env);
   const response = await env.GATEWAY_SERVICE.fetch('https://gateway.internal/send', {
     method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(12000),
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.GATEWAY_ADMIN_KEY}` },
-    body: JSON.stringify({ bot: row.bot, channel_id: reply.channel_id, content: reply.content })
+    body: JSON.stringify({ bot: row.bot, channel_id: reply.channel_id, content: reply.content,
+      ...(replySource === undefined ? {} : { reply_source: replySource }) })
   });
   if (response.status !== 200 && response.status !== 201) fail('upstream_delivery_unconfirmed');
   const body = await readBoundedJson(response);

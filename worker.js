@@ -241,12 +241,45 @@ function mentionsBot(message, botUserId) {
   return new RegExp(`<@!?${botUserId}>`).test(message.content);
 }
 
+// Agents the owner addresses by mention or by name in this server.
+// The owner's reaction rule (2026-11-09): an agent reacts when the
+// owner's message has no addressee at all, or when it is addressed
+// to that agent by mention or by name. A guild message addressed to
+// someone else is not forwarded to this bot.
+const KNOWN_AGENTS = Object.freeze([
+  { id: "1568508479293890673", names: Object.freeze(["クロワッサンド"]) }, // croissand (hosted here)
+  { id: "1568548424519913482", names: Object.freeze(["一姫", "風見一姫"]) }, // ichihime (hosted here)
+  { id: null, names: Object.freeze(["ヘルメス", "Hermes", "hermes"]) }, // Hermes (no bot on this gateway)
+]);
+
+function mentionsAgent(message, agent) {
+  if (agent.id && mentionsBot(message, agent.id)) return true;
+  return agent.names.some((name) => message.content.includes(name));
+}
+
+// True when the message is addressed to someone other than the
+// receiving bot: another known agent (by mention or name), another
+// user, or a role.
+function addressedElsewhere(message, botUserId) {
+  if (botUserId && mentionsBot(message, botUserId)) return false; // my mention
+  const self = KNOWN_AGENTS.find((a) => a.id && a.id === botUserId);
+  if (self && mentionsAgent(message, self)) return false; // addressed to me too
+  if (KNOWN_AGENTS.some((a) => a !== self && mentionsAgent(message, a))) return true;
+  const mentions = Array.isArray(message.mentions) ? message.mentions : [];
+  if (mentions.length > 0) return true;
+  if (Array.isArray(message.mention_roles) && message.mention_roles.length > 0) return true;
+  if (/<@&\d+>/.test(message.content)) return true;
+  return false;
+}
+
 // Whether a MESSAGE_CREATE message should be forwarded.
 // Ignored: our own messages, webhooks, bot messages that do not
-// mention the receiving bot, and guild messages from other members
-// (their mentions no longer pass).
-// Forwarded: everything from the owner; any bot mentioning the
-// receiving bot; DMs from other humans.
+// mention the receiving bot, guild messages from other members
+// (their mentions no longer pass), and the owner's guild messages
+// addressed to someone else (another agent, user, or role).
+// Forwarded: the owner's unaddressed messages and messages
+// addressed to the receiving bot; any bot mentioning the receiving
+// bot; DMs from other humans.
 export function shouldForwardMessage(message, botUserId) {
   if (!message || typeof message !== "object") return false;
   if (typeof message.content !== "string") return false;
@@ -254,7 +287,13 @@ export function shouldForwardMessage(message, botUserId) {
   if (!author || typeof author.id !== "string") return false;
   if (message.webhook_id) return false;
   if (botUserId && author.id === botUserId) return false; // our own messages
-  if (author.id === OWNER_USER_ID) return true; // the owner, mention or not
+  if (author.id === OWNER_USER_ID) {
+    // The owner, mention or not — except guild messages addressed
+    // to someone else, which are not for this bot. DMs always pass:
+    // a DM reaches the bot it was sent to.
+    if (message.guild_id && addressedElsewhere(message, botUserId)) return false;
+    return true;
+  }
   if (author.bot) {
     return mentionsBot(message, botUserId);
   }

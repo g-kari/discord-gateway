@@ -154,6 +154,74 @@ test("filter: the owner's plain guild messages are forwarded without a mention",
   assert.ok(req.text.endsWith("]\nno mention needed"));
 });
 
+const CROISSAND_ID = "1568508479293890673";
+const ICHIHIME_ID = "1568548424519913482";
+
+test("filter: the owner's guild message mentioning the other bot goes only to that bot", () => {
+  const m = message({
+    author: { id: OWNER_ID, username: "g_kari", bot: false },
+    content: `<@${ICHIHIME_ID}> please handle this`,
+    mentions: [{ id: ICHIHIME_ID, username: "kazami-ichihime" }],
+  });
+  assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), false);
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true);
+});
+
+test("filter: the owner's guild message naming the other bot goes only to that bot", () => {
+  const m = message({
+    author: { id: OWNER_ID, username: "g_kari", bot: false },
+    content: "一姫さんこんにちは皆様に挨拶なさい",
+  });
+  assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), false);
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true);
+});
+
+test("filter: the owner's guild message naming this bot reaches it", () => {
+  const m = message({
+    author: { id: OWNER_ID, username: "g_kari", bot: false },
+    content: "クロワッサンド、これ見て",
+  });
+  assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), true);
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false);
+});
+
+test("filter: the owner's guild message naming Hermes reaches neither hosted bot", () => {
+  const m = message({
+    author: { id: OWNER_ID, username: "g_kari", bot: false },
+    content: "ヘルメス！ダッシュボード立てて",
+  });
+  assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), false);
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false);
+});
+
+test("filter: the owner's guild message with a role mention is not forwarded", () => {
+  const m = message({
+    author: { id: OWNER_ID, username: "g_kari", bot: false },
+    content: "<@&1568548673556717571> ほかのbotからメンション飛んだら反応できるようにして",
+    mention_roles: ["1568548673556717571"],
+  });
+  assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), false);
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false);
+});
+
+test("filter: the owner's unaddressed guild message reaches both bots", () => {
+  const m = message({
+    author: { id: OWNER_ID, username: "g_kari", bot: false },
+    content: "ダッシュボード立てて",
+  });
+  assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), true);
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true);
+});
+
+test("filter: the owner's DM reaches the bot even when it names the other bot", () => {
+  const m = message({
+    guild_id: undefined,
+    author: { id: OWNER_ID, username: "g_kari", bot: false },
+    content: "一姫の様子どう？",
+  });
+  assert.equal(pure.shouldForwardMessage(m, CROISSAND_ID), true);
+});
+
 test("filter: other members' guild messages are ignored even with a mention", () => {
   const m = message({
     content: `<@${BOT_ID}> please check this`,

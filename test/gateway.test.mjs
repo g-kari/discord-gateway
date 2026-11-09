@@ -206,9 +206,9 @@ test("filter: ichihime excludes owner messages with only other user, role or bro
   const cases = [
     { content: `<@${CROISSAND_ID}> hi`, mentions: [{ id: CROISSAND_ID }] },
     { content: "<@123456789012345678> hi", mentions: [{ id: "123456789012345678" }] },
-    { content: "<@!123456789012345678> hi", mentions: [] },
+    { content: "<@!123456789012345678> hi", mentions: undefined },
     { content: "<@&123456789012345678> hi", mention_roles: ["123456789012345678"] },
-    { content: "<@&123456789012345678> hi", mention_roles: [] },
+    { content: "<@&123456789012345678> hi", mention_roles: undefined },
     { content: "@everyone hi", mention_everyone: true },
     { content: "@here hi", mention_everyone: true },
     { content: "@everyone hi" },
@@ -222,13 +222,48 @@ test("filter: ichihime excludes owner messages with only other user, role or bro
   }
 });
 
+test("filter: ichihime respects explicit empty mention metadata for plain or quoted text", () => {
+  for (const content of ["contact@here.example", "`@everyone` の使い方", "```\n@here\n```", "`<@123456789012345678>` は記法です", "`<@&123456789012345678>` はロール記法です"]) {
+    const m = message({ author: { id: OWNER_ID }, content, mentions: [], mention_roles: [], mention_everyone: false });
+    assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true, content);
+    assert.ok(pure.buildForwardRequest(m, ICHIHIME_ID), content);
+  }
+});
+
+test("filter: ichihime does not treat a quoted self ID as a real self mention", () => {
+  const m = message({ author: { id: OWNER_ID }, content: `<@${CROISSAND_ID}> この記法を見て: \`<@${ICHIHIME_ID}>\``, mentions: [{ id: CROISSAND_ID }], mention_roles: [], mention_everyone: false });
+  assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), false);
+  assert.equal(pure.buildForwardRequest(m, ICHIHIME_ID), null);
+});
+
+test("filter: ichihime uses content fallback only for missing mention metadata", () => {
+  const owner = { id: OWNER_ID };
+  const common = { author: owner, mentions: [], mention_roles: [], mention_everyone: false };
+  assert.equal(pure.shouldForwardMessage(message({ ...common, content: "contact@here.example", mention_everyone: undefined }), ICHIHIME_ID), true);
+  assert.equal(pure.shouldForwardMessage(message({ ...common, content: "@everyone hello", mention_everyone: undefined }), ICHIHIME_ID), false);
+  assert.equal(pure.shouldForwardMessage(message({ ...common, content: "<@123456789012345678> hello", mentions: undefined }), ICHIHIME_ID), false);
+  assert.equal(pure.shouldForwardMessage(message({ ...common, content: "<@&123456789012345678> hello", mention_roles: undefined }), ICHIHIME_ID), false);
+  assert.equal(pure.shouldForwardMessage(message({ ...common, content: `<@${ICHIHIME_ID}> hello`, mentions: undefined }), ICHIHIME_ID), true);
+});
+
 test("filter: ichihime's mention or name overrides other mentions for owner messages", () => {
   for (const own of [`<@${ICHIHIME_ID}>`, `<@!${ICHIHIME_ID}>`, "一姫", "風見一姫"]) {
     for (const other of [`<@${CROISSAND_ID}>`, "<@&123456789012345678>", "@everyone", "@here"]) {
-      const m = message({ author: { id: OWNER_ID }, content: `${other} ${own} こんにちは`, mentions: [{ id: CROISSAND_ID }], mention_everyone: true });
+      const mentions = [{ id: CROISSAND_ID }];
+      if (own.startsWith("<@")) mentions.push({ id: ICHIHIME_ID });
+      const m = message({ author: { id: OWNER_ID }, content: `${other} ${own} こんにちは`, mentions, mention_everyone: true });
       assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true, m.content);
       assert.ok(pure.buildForwardRequest(m, ICHIHIME_ID), m.content);
     }
+  }
+});
+
+test("filter: accepted owner mention-only and whitespace-only messages produce no request", () => {
+  for (const content of [`<@${ICHIHIME_ID}>`, `  <@!${ICHIHIME_ID}> \n\t`, " \n\t", ""]) {
+    const mentions = content.includes("<@") ? [{ id: ICHIHIME_ID }] : [];
+    const m = message({ author: { id: OWNER_ID }, content, mentions, mention_roles: [], mention_everyone: false });
+    assert.equal(pure.shouldForwardMessage(m, ICHIHIME_ID), true, JSON.stringify(content));
+    assert.equal(pure.buildForwardRequest(m, ICHIHIME_ID), null, JSON.stringify(content));
   }
 });
 

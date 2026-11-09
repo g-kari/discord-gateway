@@ -262,19 +262,29 @@ function mentionsAgent(message, agent) {
 // True when an owner guild message does not meet the receiving bot's
 // addressing rule. Always check self-address before other mentions.
 function addressedElsewhere(message, botUserId) {
-  if (botUserId && mentionsBot(message, botUserId)) return false; // my mention
   const self = KNOWN_AGENTS.find((a) => a.id && a.id === botUserId);
-  if (self && mentionsAgent(message, self)) return false; // addressed to me too
   if (botUserId === ICHIHIME_USER_ID) {
+    const hasUserMetadata = Array.isArray(message.mentions);
+    const selfMentioned = hasUserMetadata
+      ? message.mentions.some((m) => m && m.id === botUserId)
+      : mentionsBot(message, botUserId);
+    if (selfMentioned || self.names.some((name) => message.content.includes(name))) return false;
     // No self-address: any user/role/broadcast mention excludes this
-    // message. Names alone are not Discord mentions. Content fallbacks
-    // handle synthetic/replayed events with missing mention metadata.
-    return (Array.isArray(message.mentions) && message.mentions.length > 0)
-      || (Array.isArray(message.mention_roles) && message.mention_roles.length > 0)
-      || message.mention_everyone === true
-      || /<@(?:!|&)?\d+>/.test(message.content)
-      || /@(?:everyone|here)\b/.test(message.content);
+    // message. Explicit empty/false Discord metadata is authoritative,
+    // including for quoted syntax and literal text such as email addresses.
+    // Fall back to content only when that category's metadata is absent.
+    return (hasUserMetadata
+      ? message.mentions.length > 0
+      : /<@!?\d+>/.test(message.content))
+      || (Array.isArray(message.mention_roles)
+        ? message.mention_roles.length > 0
+        : /<@&\d+>/.test(message.content))
+      || (typeof message.mention_everyone === "boolean"
+        ? message.mention_everyone
+        : /(?:^|[^\p{L}\p{N}_@])@(?:everyone|here)(?![\p{L}\p{N}_])/u.test(message.content));
   }
+  if (botUserId && mentionsBot(message, botUserId)) return false; // my mention
+  if (self && mentionsAgent(message, self)) return false; // addressed to me too
   if (KNOWN_AGENTS.some((a) => a !== self && mentionsAgent(message, a))) return true;
   const mentions = Array.isArray(message.mentions) ? message.mentions : [];
   if (mentions.length > 0) return true;

@@ -89,11 +89,19 @@ test("filter: the bot's own messages are ignored", () => {
   assert.equal(pure.buildForwardRequest(m, BOT_ID), null);
 });
 
-test("filter: other bots' messages are ignored", () => {
+test("filter: other bots mentioning the bot are forwarded", () => {
   const m = message({
     author: { id: "555666777888999000", username: "other-bot", bot: true },
     mentions: [{ id: BOT_ID }],
     content: `<@${BOT_ID}> hi`,
+  });
+  assert.equal(pure.shouldForwardMessage(m, BOT_ID), true);
+});
+
+test("filter: bot messages without a mention of the bot are ignored", () => {
+  const m = message({
+    author: { id: "555666777888999000", username: "other-bot", bot: true },
+    content: "bot chatter with no mention",
   });
   assert.equal(pure.shouldForwardMessage(m, BOT_ID), false);
 });
@@ -155,7 +163,7 @@ test("filter: other members' guild messages are ignored even with a mention", ()
   assert.equal(pure.buildForwardRequest(m, BOT_ID), null);
 });
 
-test("filter: trusted bots mentioning the bot are forwarded", () => {
+test("filter: hosted bots mentioning the bot are forwarded", () => {
   const m = message({
     author: { id: "1568548424519913482", username: "kazami-ichihime", bot: true },
     content: `<@${BOT_ID}> handoff`,

@@ -229,14 +229,10 @@ export async function verifyBody(secret, msgId, timestampSec, body, signatureHea
 // forwarded — DM or guild channel, with or without a mention.
 const OWNER_USER_ID = "333933401314951168";
 
-// Bot authors are ignored, except for these trusted bots when they
-// mention the receiving bot: the two hosted bots (so they can hand
-// messages to each other) and the owner's standalone Ichihime app.
-const TRUSTED_BOT_IDS = Object.freeze([
-  "1568508479293890673", // croissand (hosted here)
-  "1568548424519913482", // ichihime (hosted here)
-  "1568471627606270042", // owner's standalone Ichihime app
-]);
+// Bot authors are forwarded only when they mention the receiving
+// bot, so the bots in the owner's servers can hand messages to each
+// other and react to one another (owner's instruction, 2026-11-09).
+// Bot messages without a mention of the receiving bot are ignored.
 
 function mentionsBot(message, botUserId) {
   if (!botUserId) return false;
@@ -246,9 +242,10 @@ function mentionsBot(message, botUserId) {
 }
 
 // Whether a MESSAGE_CREATE message should be forwarded.
-// Ignored: our own messages, webhooks, untrusted bot authors, and
-// guild messages from other members (their mentions no longer pass).
-// Forwarded: everything from the owner; trusted bots mentioning the
+// Ignored: our own messages, webhooks, bot messages that do not
+// mention the receiving bot, and guild messages from other members
+// (their mentions no longer pass).
+// Forwarded: everything from the owner; any bot mentioning the
 // receiving bot; DMs from other humans.
 export function shouldForwardMessage(message, botUserId) {
   if (!message || typeof message !== "object") return false;
@@ -259,7 +256,7 @@ export function shouldForwardMessage(message, botUserId) {
   if (botUserId && author.id === botUserId) return false; // our own messages
   if (author.id === OWNER_USER_ID) return true; // the owner, mention or not
   if (author.bot) {
-    return TRUSTED_BOT_IDS.includes(author.id) && mentionsBot(message, botUserId);
+    return mentionsBot(message, botUserId);
   }
   const isDm = !message.guild_id || message.channel_type === 1 || message.channel_type === 3;
   if (isDm) return true;

@@ -15,8 +15,9 @@
 // duration charges. SQLite state survives restarts and alarms
 // reconnect/resume each connection independently.
 //
-// Inbound: MESSAGE_CREATE events that are DMs to a bot, or that mention
-// that bot in a guild channel, are forwarded to the dots-events server.
+// Inbound: MESSAGE_CREATE events are filtered by sender and the
+// receiving bot's addressing rule (see shouldForwardMessage below).
+// Eligible DMs and guild messages are forwarded to dots-events.
 // The body is
 //   {"text": ..., "topic": "discord", "request_id": "discord-<message id>"}
 // and the receiver deduplicates by request_id, so redelivery (Discord
@@ -225,9 +226,10 @@ export async function verifyBody(secret, msgId, timestampSec, body, signatureHea
 
 // ---------- inbound message filtering / forwarding shape ----------
 
-// The owner's Discord user id. The owner's messages are always
-// forwarded — DM or guild channel, with or without a mention.
+// The owner's Discord user id. Owner guild messages use the receiving
+// bot's addressing rule below; owner DMs retain their existing routing.
 const OWNER_USER_ID = "333933401314951168";
+const ICHIHIME_USER_ID = "1568548424519913482";
 
 // Bot authors are forwarded only when they mention the receiving
 // bot, so the bots in the owner's servers can hand messages to each
@@ -242,13 +244,13 @@ function mentionsBot(message, botUserId) {
 }
 
 // Agents the owner addresses by mention or by name in this server.
-// The owner's reaction rule (2026-11-09): an agent reacts when the
-// owner's message has no addressee at all, or when it is addressed
-// to that agent by mention or by name. A guild message addressed to
-// someone else is not forwarded to this bot.
+// Names remain an explicit self-address for either hosted bot.
+// Ichihime's owner rule treats other agents' names as ordinary text:
+// no Discord mentions, or ichihime's own mention/name, is sufficient.
+// Croissand's existing name-based addressing rule is unchanged.
 const KNOWN_AGENTS = Object.freeze([
   { id: "1568508479293890673", names: Object.freeze(["クロワッサンド"]) }, // croissand (hosted here)
-  { id: "1568548424519913482", names: Object.freeze(["一姫", "風見一姫"]) }, // ichihime (hosted here)
+  { id: ICHIHIME_USER_ID, names: Object.freeze(["一姫", "風見一姫"]) }, // ichihime (hosted here)
   { id: null, names: Object.freeze(["ヘルメス", "Hermes", "hermes"]) }, // Hermes (no bot on this gateway)
 ]);
 
@@ -257,12 +259,31 @@ function mentionsAgent(message, agent) {
   return agent.names.some((name) => message.content.includes(name));
 }
 
-// True when the message is addressed to someone other than the
-// receiving bot: another known agent (by mention or name), another
-// user, or a role.
+// True when an owner guild message does not meet the receiving bot's
+// addressing rule. Always check self-address before other mentions.
 function addressedElsewhere(message, botUserId) {
-  if (botUserId && mentionsBot(message, botUserId)) return false; // my mention
   const self = KNOWN_AGENTS.find((a) => a.id && a.id === botUserId);
+  if (botUserId === ICHIHIME_USER_ID) {
+    const hasUserMetadata = Array.isArray(message.mentions);
+    const selfMentioned = hasUserMetadata
+      ? message.mentions.some((m) => m && m.id === botUserId)
+      : mentionsBot(message, botUserId);
+    if (selfMentioned || self.names.some((name) => message.content.includes(name))) return false;
+    // No self-address: any user/role/broadcast mention excludes this
+    // message. Explicit empty/false Discord metadata is authoritative,
+    // including for quoted syntax and literal text such as email addresses.
+    // Fall back to content only when that category's metadata is absent.
+    return (hasUserMetadata
+      ? message.mentions.length > 0
+      : /<@!?\d+>/.test(message.content))
+      || (Array.isArray(message.mention_roles)
+        ? message.mention_roles.length > 0
+        : /<@&\d+>/.test(message.content))
+      || (typeof message.mention_everyone === "boolean"
+        ? message.mention_everyone
+        : /(?:^|[^\p{L}\p{N}_@])@(?:everyone|here)(?![\p{L}\p{N}_])/u.test(message.content));
+  }
+  if (botUserId && mentionsBot(message, botUserId)) return false; // my mention
   if (self && mentionsAgent(message, self)) return false; // addressed to me too
   if (KNOWN_AGENTS.some((a) => a !== self && mentionsAgent(message, a))) return true;
   const mentions = Array.isArray(message.mentions) ? message.mentions : [];
@@ -275,8 +296,8 @@ function addressedElsewhere(message, botUserId) {
 // Whether a MESSAGE_CREATE message should be forwarded.
 // Ignored: our own messages, webhooks, bot messages that do not
 // mention the receiving bot, guild messages from other members
-// (their mentions no longer pass), and the owner's guild messages
-// addressed to someone else (another agent, user, or role).
+// (their mentions no longer pass), and owner guild messages excluded
+// by the receiving bot's addressing rule.
 // Forwarded: the owner's unaddressed messages and messages
 // addressed to the receiving bot; any bot mentioning the receiving
 // bot; DMs from other humans.

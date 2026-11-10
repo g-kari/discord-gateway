@@ -75,6 +75,10 @@ date round trip); source creation and first receipt must both be on or
 after it. Set it to the approved activation boundary to prevent backlog replies.
 Authentication still requires the existing read and send scopes; the status
 tool reports `send_scope_granted` without exposing a token. It does not grant it.
+Read-only tools retain the read baseline; both send tools publish read-plus-send
+requirements and return a host-mediated consent challenge when send scope is
+missing. See [OAuth tool scope step-up](oauth-tool-scope-step-up.md) for host refresh
+and approval boundaries.
 
 Before activation:
 

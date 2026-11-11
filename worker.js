@@ -33,6 +33,18 @@
 //     Authorization: Bearer <EVENTS_TRIGGER_KEY>, no signing (the
 //     /claude-hook intake and its secret belong to Muse's side only).
 //
+// Hermes ambient shadow feed (Phase 1): MESSAGE_CREATE events in the
+// owner's main guild channel that mention NEITHER hosted bot are also
+// duplicated — from croissand's stream only — into a shadow feed for
+// Hermes: topic "hermes-ambient", request_id "ambient-<message id>",
+// delivered to dots-events' /trigger in trigger mode, filed under
+// croissand's outbox rows. The gateway only duplicates, deduplicates
+// (outbox / forward_log, keyed (bot, request_id)) and holds: copies
+// filed during JST quiet hours (23:00–08:00) stay in the outbox until
+// 08:00 and are flushed by the existing alarm. Hermes posts nothing
+// back through this feed in Phase 1, and the mention-required
+// forwarding above is unchanged.
+//
 // Outbound: agents reply into Discord through POST /send on this Worker
 // (admin-key auth), which calls the Discord REST API with the selected
 // bot's token.
@@ -74,7 +86,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 const SERVICE_NAME = "discord-gateway";
-const SERVICE_VERSION = "0.5.0";
+const SERVICE_VERSION = "0.6.0";
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const DEFAULT_GATEWAY_URL = "wss://gateway.discord.gg";
 const CLAUDE_HOOK_URL = "https://dots-events.0g0.xyz/claude-hook";
@@ -311,6 +323,85 @@ export function buildForwardRequest(message, botUserId) {
   return { text, topic: "discord", request_id: `discord-${message.id}` };
 }
 
+// ---------- Hermes ambient shadow feed (Phase 1) ----------
+// A second, independent copy of the main guild channel's conversation
+// for Hermes. The scope is deliberately narrow: ONE channel (the
+// owner's main channel in the 放送局 guild), human authors only, and
+// only messages that mention neither hosted bot — anything mentioning
+// croissand or ichihime belongs to the existing forwarding routes
+// above, never to this feed. The gateway's whole job here is to
+// duplicate, deduplicate and hold (see ambientDeliveryTime); whether
+// a copied message deserves a reaction is Hermes' decision, made on
+// its side. Phase 1 is shadow-only: Hermes logs its would-be
+// reactions and posts nothing.
+
+const AMBIENT_GUILD_ID = "413624636673359882";
+const AMBIENT_CHANNEL_ID = "477496219040743435";
+const AMBIENT_TOPIC = "hermes-ambient";
+const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+// Build the shadow-feed copy of a message, or null when the message
+// is outside the feed's scope. The text keeps the same header line as
+// a regular forward so Hermes reads both feeds the same way; nothing
+// is stripped, because a mention of either hosted bot already
+// excluded the message.
+export function buildAmbientRequest(message) {
+  if (!message || typeof message !== "object") return null;
+  if (typeof message.content !== "string") return null;
+  if (typeof message.id !== "string" || !message.id) return null;
+  if (message.guild_id !== AMBIENT_GUILD_ID) return null;
+  if (message.channel_id !== AMBIENT_CHANNEL_ID) return null;
+  if (message.webhook_id) return null;
+  const author = message.author;
+  if (!author || typeof author.id !== "string") return null;
+  if (author.bot) return null; // hosted bots and third-party bots alike
+  if (
+    author.id === BOT_CONFIGS.croissand.userId ||
+    author.id === BOT_CONFIGS.ichihime.userId
+  ) {
+    return null;
+  }
+  if (mentionsBot(message, BOT_CONFIGS.croissand.userId)) return null;
+  if (mentionsBot(message, BOT_CONFIGS.ichihime.userId)) return null;
+  const content = message.content.trim();
+  if (!content) return null;
+  const username =
+    typeof author.username === "string" && author.username
+      ? author.username
+      : "unknown";
+  const text =
+    `[discord channel:${message.channel_id} guild:${message.guild_id} author:${username}]\n` +
+    content;
+  return { text, topic: AMBIENT_TOPIC, request_id: `ambient-${message.id}` };
+}
+
+// When an ambient copy filed at `now` may be delivered. Copies filed
+// during JST quiet hours (23:00–08:00) are held until the next 08:00
+// JST; anything filed outside quiet hours is due immediately (the
+// input timestamp itself). JST is a fixed UTC+9 offset (no DST), so
+// the wall clock is read off the shifted UTC fields.
+export function ambientDeliveryTime(now) {
+  const jst = new Date(now + JST_OFFSET_MS);
+  const hour = jst.getUTCHours();
+  if (hour >= 8 && hour < 23) return now;
+  const day = hour >= 23 ? jst.getUTCDate() + 1 : jst.getUTCDate();
+  return (
+    Date.UTC(jst.getUTCFullYear(), jst.getUTCMonth(), day, 8, 0, 0, 0) -
+    JST_OFFSET_MS
+  );
+}
+
+// Whether a stored outbox body is an ambient-feed copy (its delivery
+// goes to /trigger even though the row sits under croissand).
+function isAmbientRequestBody(body) {
+  try {
+    const parsed = JSON.parse(body);
+    return Boolean(parsed) && parsed.topic === AMBIENT_TOPIC;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Automatic replies have a narrower source boundary than forwarding.
 // Never trust a caller-supplied author: only an observed Gateway event
 // can create a source. The ledger stores a digest, never another copy
@@ -413,9 +504,20 @@ export function forwardSecret(env) {
     : env.CLAUDE_HOOK_SECRET;
 }
 
-// Resolve the effective { mode, secret } for one delivery: the bot's
-// static config when a bot is named, the legacy env fallback otherwise.
-function forwardTarget(env, bot) {
+// Resolve the effective { mode, secret } for one delivery: an
+// explicit mode override when one is given (ambient shadow copies sit
+// in croissand's outbox but are delivered in trigger mode, with the
+// trigger credential), else the bot's static config when a bot is
+// named, else the legacy env fallback.
+function forwardTarget(env, bot, modeOverride) {
+  if (modeOverride === "trigger" || modeOverride === "claude-hook") {
+    return {
+      mode: modeOverride,
+      secret: env
+        ? env[modeOverride === "trigger" ? "EVENTS_TRIGGER_KEY" : "CLAUDE_HOOK_SECRET"]
+        : undefined,
+    };
+  }
   const config = knownBot(bot) ? BOT_CONFIGS[bot] : null;
   if (config) {
     return {
@@ -430,7 +532,9 @@ function forwardTarget(env, bot) {
 // injected fetch implementation, so the mode dispatch and the retry
 // classification are unit-testable without a Durable Object. `bot`
 // names the bot the row belongs to (its static config picks the mode
-// and credential); omit it for the legacy env-driven dispatch.
+// and credential); omit it for the legacy env-driven dispatch. `mode`
+// overrides the dispatch mode (and its credential) for rows whose
+// delivery differs from their owner's — the ambient shadow copies.
 // Returns:
 //   { delivered, final, error, retryAfterMs }
 // - delivered: the receiver accepted the request (HTTP 2xx).
@@ -440,8 +544,8 @@ function forwardTarget(env, bot) {
 //   itself); claude-hook mode retries every failure to the cap,
 //   exactly as before.
 // - retryAfterMs: the receiver's 429 delay hint, when one was given.
-export async function attemptForward({ env, bot, fetchImpl, requestId, body }) {
-  const { mode, secret } = forwardTarget(env, bot);
+export async function attemptForward({ env, bot, mode: modeOverride, fetchImpl, requestId, body }) {
+  const { mode, secret } = forwardTarget(env, bot, modeOverride);
   if (mode === "trigger") {
     try {
       const res = await fetchImpl(EVENTS_TRIGGER_URL, {
@@ -752,6 +856,13 @@ export function handleGatewayPayload(inputState, payload, opts = {}) {
         state.lastMessageAt = now;
         const request = buildForwardRequest(d, state.botUserId);
         if (request) actions.push({ type: "forward", request });
+        // The ambient shadow copy is computed for every bot's stream
+        // (this machine is bot-agnostic), but the Durable Object only
+        // enqueues it from croissand's stream: both bots see the same
+        // guild message, and one copy is enough — the (bot,
+        // request_id) outbox/forward_log keys do the rest.
+        const ambient = buildAmbientRequest(d);
+        if (ambient) actions.push({ type: "ambient", request: ambient });
       }
       break;
     }
@@ -1477,6 +1588,13 @@ export class Gateway extends DurableObject {
         }
       } else if (action.type === "forward") {
         await this.enqueueForward(action.request, botKey);
+      } else if (action.type === "ambient") {
+        // Only croissand's stream feeds the shadow copy (see
+        // handleGatewayPayload): the same guild message arrives on
+        // both bots' sockets, and one copy is the whole feed.
+        if (botKey === PRIMARY_BOT) {
+          await this.enqueueAmbientForward(action.request);
+        }
       } else if (action.type === "close_socket") {
         this.closeGatewaySocket(botKey, ws, "reconnecting");
       }
@@ -1734,7 +1852,7 @@ export class Gateway extends DurableObject {
 
   // --- forwarding outbox (SQLite) ---
 
-  insertOutbox(request, botKey) {
+  insertOutbox(request, botKey, nextAttemptAt = null) {
     const now = Date.now();
     this.ctx.storage.sql.exec(
       "INSERT OR IGNORE INTO outbox (bot, request_id, body, attempts, next_attempt_at, created_at) " +
@@ -1742,7 +1860,7 @@ export class Gateway extends DurableObject {
       botKey,
       request.request_id,
       JSON.stringify(request),
-      now,
+      nextAttemptAt ?? now,
       now
     );
   }
@@ -1780,6 +1898,30 @@ export class Gateway extends DurableObject {
     const state = this.loadState(botKey);
     // A replay may have hit INSERT OR IGNORE for a row already backing
     // off. Respect its stored Retry-After instead of arming a busy loop.
+    state.nextOutboxAt = this.earliestOutboxAt(botKey);
+    this.saveState(state, botKey);
+    // The caller schedules the stored deadline after persisting this row.
+  }
+
+  // Queue one ambient shadow copy under croissand, the bot whose
+  // stream it is taken from. Dedup mirrors enqueueForward: forward_log
+  // covers the delivered case, the outbox primary key the queued one.
+  // The hold is the outbox itself: a copy filed during JST quiet
+  // hours gets the next 08:00 JST as its next_attempt_at, so the
+  // regular alarm / flush machinery delivers it once it comes due
+  // and never before.
+  async enqueueAmbientForward(request, now = Date.now()) {
+    const botKey = PRIMARY_BOT;
+    const seen = this.ctx.storage.sql
+      .exec(
+        "SELECT request_id FROM forward_log WHERE bot = ? AND request_id = ?",
+        botKey,
+        request.request_id
+      )
+      .toArray();
+    if (seen.length) return;
+    this.insertOutbox(request, botKey, ambientDeliveryTime(now));
+    const state = this.loadState(botKey);
     state.nextOutboxAt = this.earliestOutboxAt(botKey);
     this.saveState(state, botKey);
     // The caller schedules the stored deadline after persisting this row.
@@ -1823,9 +1965,13 @@ export class Gateway extends DurableObject {
     for (const row of rows) {
       const attempts = row.attempts + 1;
       let delayMs = Math.min(60000, 1000 * 2 ** attempts);
+      // Ambient shadow copies sit in croissand's outbox but deliver
+      // to /trigger in trigger mode, like ichihime's forwards.
+      const ambient = isAmbientRequestBody(row.body);
       const result = await attemptForward({
         env: this.env,
         bot: botKey,
+        mode: ambient ? "trigger" : undefined,
         fetchImpl: fetch,
         requestId: row.request_id,
         body: row.body,
@@ -1859,9 +2005,15 @@ export class Gateway extends DurableObject {
             state.lastForwardAt = Date.now();
           } else state.droppedForwardCount += 1;
         } else {
+          // A failed ambient retry never lands inside quiet hours
+          // either: when the plain backoff would fall in 23:00–08:00
+          // JST, the next attempt waits for the next 08:00 JST.
+          const retryAt = ambient
+            ? Math.max(Date.now() + delayMs, ambientDeliveryTime(Date.now()))
+            : Date.now() + delayMs;
           this.ctx.storage.sql.exec(
             "UPDATE outbox SET attempts = ?, next_attempt_at = ? WHERE bot = ? AND request_id = ?",
-            attempts, Date.now() + delayMs, botKey, row.request_id
+            attempts, retryAt, botKey, row.request_id
           );
         }
         this.ctx.storage.sql.exec(

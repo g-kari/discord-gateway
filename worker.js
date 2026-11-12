@@ -2,22 +2,28 @@
 //
 // A single Durable Object (class Gateway, SQLite-backed, one global
 // instance) keeps persistent outbound WebSocket connections to the
-// Discord Gateway — ONE PER CONFIGURED BOT. Two bots share the Worker
+// Discord Gateway — ONE PER CONFIGURED BOT. Three bots share the Worker
 // and the object (the owner's cost decision: one resident object
-// instead of two deployments):
+// instead of three deployments):
 //   "croissand" (primary): Muse's bot. Forwards go to dots-events'
 //     /claude-hook (signed), filed as requests for Muse.
 //   "ichihime": dots' bot. Forwards go to dots-events' /trigger
 //     (Bearer key), filed as requests for the hub's subscribers.
+//   "tako" (たこ): a Grok Bot assistant. Forwards go to a generic
+//     HTTPS webhook (TAKO_WEBHOOK_URL) with TAKO_WEBHOOK_KEY. The
+//     header defaults to Authorization: Bearer <key>; set
+//     TAKO_WEBHOOK_AUTH_HEADER to send the key under another name.
 // A bot whose secrets are not set is simply idle: it never connects
-// and never errors, while the other bot runs exactly as before.
+// and never errors, while the other bots run exactly as before.
 // Outgoing sockets cannot hibernate, so a connected object incurs
 // duration charges. SQLite state survives restarts and alarms
 // reconnect/resume each connection independently.
 //
 // Inbound: MESSAGE_CREATE events are filtered by sender and the
 // receiving bot's mention rule (see shouldForwardMessage below).
-// Eligible DMs and guild messages are forwarded to dots-events.
+// Eligible DMs and guild messages are forwarded to that bot's target
+// (dots-events for croissand and ichihime, the configured HTTPS
+// webhook for tako).
 // The body is
 //   {"text": ..., "topic": "discord", "request_id": "discord-<message id>"}
 // and the receiver deduplicates by request_id, so redelivery (Discord
@@ -32,13 +38,20 @@
 //   ichihime → POST https://dots-events.0g0.xyz/trigger with
 //     Authorization: Bearer <EVENTS_TRIGGER_KEY>, no signing (the
 //     /claude-hook intake and its secret belong to Muse's side only).
+//   tako → POST TAKO_WEBHOOK_URL with the configured auth header
+//     (default Authorization: Bearer <TAKO_WEBHOOK_KEY>), no signing.
+//     Status handling matches trigger mode: 429 honors Retry-After,
+//     any other 4xx is terminal, 5xx and network errors are retried.
 //
 // Hermes ambient shadow feed (Phase 1): MESSAGE_CREATE events in the
 // owner's main guild channel that mention NEITHER hosted bot are also
 // duplicated — from croissand's stream only — into a shadow feed for
 // Hermes: topic "hermes-ambient", request_id "ambient-<message id>",
 // delivered to dots-events' /trigger in trigger mode, filed under
-// croissand's outbox rows. The gateway only duplicates, deduplicates
+// croissand's outbox rows. Messages that mention a hosted bot, or that
+// the owner name-calls, stay on that bot's forward route and are not
+// copied. The gateway
+// only duplicates, deduplicates
 // (outbox / forward_log, keyed (bot, request_id)) and holds: copies
 // filed during JST quiet hours (23:00–08:00) stay in the outbox until
 // 08:00 and are flushed by the existing alarm. Hermes posts nothing
@@ -57,6 +70,15 @@
 //                              croissand's /claude-hook forwards
 //   EVENTS_TRIGGER_KEY       — secret; Bearer key for ichihime's
 //                              /trigger forwards
+//   DISCORD_BOT_TOKEN_TAKO   — secret; tako's Discord bot token
+//   TAKO_WEBHOOK_URL         — secret; HTTPS URL of tako's Grok Bot
+//                              webhook trigger
+//   TAKO_WEBHOOK_KEY         — secret; credential sent with tako's
+//                              webhook POST
+//   TAKO_WEBHOOK_AUTH_HEADER — optional; header name for that
+//                              credential (default Authorization, which
+//                              sends "Bearer <key>"; any other name
+//                              sends the raw key)
 //   ADMIN_KEY                — secret; key for POST /connect, /send,
 //                              /avatar
 //   FORWARD_MODE             — legacy var, only consulted by
@@ -68,7 +90,7 @@
 //   GET  /status   public; {"connected": bool, "ready": bool} for the
 //                  primary bot (legacy shape) plus "bots" detail:
 //                  {"bots": {"croissand": {"connected", "ready",
-//                  "configured"}, "ichihime": {...}}}
+//                  "configured"}, "ichihime": {...}, "tako": {...}}}
 //   POST /connect  admin key; nudge the Durable Object to (re)connect;
 //                  optional JSON body {"bot": "ichihime"} targets one
 //                  bot (absent = all bots). The response carries
@@ -86,7 +108,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 const SERVICE_NAME = "discord-gateway";
-const SERVICE_VERSION = "0.6.0";
+const SERVICE_VERSION = "0.7.0";
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const DEFAULT_GATEWAY_URL = "wss://gateway.discord.gg";
 const CLAUDE_HOOK_URL = "https://dots-events.0g0.xyz/claude-hook";
@@ -126,6 +148,18 @@ const BOT_CONFIGS = Object.freeze({
     forwardSecretEnv: "EVENTS_TRIGGER_KEY",
     userId: "1568548424519913482",
   }),
+  tako: Object.freeze({
+    key: "tako",
+    tokenEnv: "DISCORD_BOT_TOKEN_TAKO",
+    forwardMode: "webhook",
+    forwardSecretEnv: "TAKO_WEBHOOK_KEY",
+    webhookUrlEnv: "TAKO_WEBHOOK_URL",
+    webhookAuthHeaderEnv: "TAKO_WEBHOOK_AUTH_HEADER",
+    // Name calls the owner can use in guild messages. The live Discord
+    // user id is learned from READY; none is hardcoded.
+    names: Object.freeze(["たこ", "たこ · 秘書", "tako"]),
+    userId: null,
+  }),
 });
 const BOT_KEYS = Object.freeze(Object.keys(BOT_CONFIGS));
 const PRIMARY_BOT = "croissand";
@@ -134,13 +168,52 @@ function knownBot(botKey) {
   return typeof botKey === "string" && Object.hasOwn(BOT_CONFIGS, botKey);
 }
 
-// A bot is configured when both its token and its forward credential
-// are present in env. Unconfigured bots stay idle (no connection
-// attempts, no errors) while configured bots run normally.
+// A bot is configured when its token and its forward credential are
+// both present. Webhook bots (tako) also need an https URL and a safe
+// auth header; the header name is optional and defaults to
+// Authorization. Unconfigured bots stay idle (no connection attempts,
+// no errors) while configured bots run normally.
+function validWebhookUrl(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2048) return false;
+  if (value !== value.trim() || /[\r\n\0]/.test(value)) return false;
+  let url;
+  try {
+    url = new URL(value);
+  } catch (_) {
+    return false;
+  }
+  return url.protocol === "https:" && url.username === "" && url.password === "" && url.hostname !== "";
+}
+
+function webhookHeaderName(env, config) {
+  const raw = env?.[config.webhookAuthHeaderEnv];
+  if (raw === undefined || raw === null) return "Authorization";
+  if (typeof raw !== "string") return null;
+  const name = raw.trim();
+  if (!name || name !== raw || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) return null;
+  return name;
+}
+
+// Resolved webhook request parts, or null when the bot must stay idle.
+// The Authorization header is "Bearer <key>"; every other header name
+// carries the raw key. Secrets with CR/LF never become headers.
+function webhookTarget(env, config) {
+  if (!env || !config?.webhookUrlEnv) return null;
+  const secret = env[config.forwardSecretEnv];
+  const url = env[config.webhookUrlEnv];
+  const headerName = webhookHeaderName(env, config);
+  if (typeof secret !== "string" || secret.length === 0 || /[\r\n\0]/.test(secret)) return null;
+  if (!validWebhookUrl(url) || !headerName) return null;
+  const headerValue = headerName.toLowerCase() === "authorization" ? `Bearer ${secret}` : secret;
+  return { url, headerName, headerValue };
+}
+
 export function botConfigured(env, botKey) {
   const config = knownBot(botKey) ? BOT_CONFIGS[botKey] : null;
   if (!config || !env) return false;
-  return Boolean(env[config.tokenEnv] && env[config.forwardSecretEnv]);
+  if (!env[config.tokenEnv]) return false;
+  if (config.forwardMode === "webhook") return webhookTarget(env, config) !== null;
+  return Boolean(env[config.forwardSecretEnv]);
 }
 
 // ---------- small helpers ----------
@@ -262,15 +335,83 @@ function mentionsBot(message, botUserId) {
   return new RegExp(`<@!?${botUserId}>`).test(message.content);
 }
 
+function boundaryChar(ch) {
+  return ch === "" || !/[\p{L}\p{N}_]/u.test(ch);
+}
+
+// Latin names match as whole words, case-insensitively. "takoyaki" and
+// "stako" are not calls; "hey tako!" is.
+function hasLatinName(text, name) {
+  const hay = text.toLowerCase();
+  const needle = name.toLowerCase();
+  let from = 0;
+  while (from < hay.length) {
+    const at = hay.indexOf(needle, from);
+    if (at < 0) return false;
+    const before = at === 0 ? "" : hay[at - 1];
+    const after = at + needle.length >= hay.length ? "" : hay[at + needle.length];
+    if (boundaryChar(before) && boundaryChar(after)) return true;
+    from = at + needle.length;
+  }
+  return false;
+}
+
+// A kana/kanji name matches at a boundary. The character after the
+// name may start a sentence ("たこ教えて"); the food word 焼 does not
+// ("たこ焼き" is not a call).
+function hasKanaCall(text, name) {
+  let from = 0;
+  while (from < text.length) {
+    const at = text.indexOf(name, from);
+    if (at < 0) return false;
+    const before = at === 0 ? "" : text[at - 1];
+    const after = text.slice(at + name.length);
+    if (boundaryChar(before) && !after.startsWith("焼")) return true;
+    from = at + name.length;
+  }
+  return false;
+}
+
+// Owner guild name-calls. `names` comes from the receiving bot's
+// config; bots without a list (croissand, ichihime) never match.
+// Display names accept the common middle dots and surrounding spaces.
+function nameCallsBot(content, names) {
+  if (typeof content !== "string" || !content || !Array.isArray(names) || names.length === 0) {
+    return false;
+  }
+  let text;
+  try {
+    text = content.normalize("NFKC");
+  } catch (_) {
+    return false;
+  }
+  for (const name of names) {
+    if (typeof name !== "string" || !name) continue;
+    if (/[·・•]/.test(name)) {
+      if (/たこ\s*[·・•]\s*秘書/u.test(text)) return true;
+      continue;
+    }
+    if (/^[\p{Script=Latin}]+$/u.test(name)) {
+      if (hasLatinName(text, name)) return true;
+      continue;
+    }
+    if (hasKanaCall(text, name)) return true;
+  }
+  return false;
+}
+
 
 // Whether a MESSAGE_CREATE message should be forwarded.
 // Ignored: our own messages, webhooks, bot messages that do not
 // mention the receiving bot, guild messages from other members,
-// and owner guild messages that do not mention the receiving bot.
-// Forwarded: owner guild messages mentioning the receiving bot;
-// any bot mentioning the receiving bot; DMs from the owner and
-// from other humans.
-export function shouldForwardMessage(message, botUserId) {
+// and owner guild messages that do not mention or name-call the
+// receiving bot.
+// Forwarded: owner guild messages mentioning the receiving bot, or
+// name-calling a bot that lists names; any bot mentioning the
+// receiving bot; DMs from the owner and from other humans.
+// `opts.names` is the receiving bot's name list. Omit it and name
+// calls stay off, which is croissand's and ichihime's behavior.
+export function shouldForwardMessage(message, botUserId, opts = {}) {
   if (!message || typeof message !== "object") return false;
   if (typeof message.content !== "string") return false;
   const author = message.author;
@@ -278,10 +419,12 @@ export function shouldForwardMessage(message, botUserId) {
   if (message.webhook_id) return false;
   if (botUserId && author.id === botUserId) return false; // our own messages
   if (author.id === OWNER_USER_ID) {
-    // The owner: guild messages forward only on a mention of the
-    // receiving bot. DMs always pass: a DM reaches the bot it was
-    // sent to.
-    if (message.guild_id) return mentionsBot(message, botUserId);
+    // The owner: guild messages forward on a mention of the receiving
+    // bot, or on that bot's name call. DMs always pass: a DM reaches
+    // the bot it was sent to. Name calls do not apply to other senders.
+    if (message.guild_id) {
+      return mentionsBot(message, botUserId) || nameCallsBot(message.content, opts.names);
+    }
     return true;
   }
   if (author.bot) {
@@ -296,8 +439,8 @@ export function shouldForwardMessage(message, botUserId) {
 // when there is nothing to forward (e.g. the message was only a mention).
 // The first line identifies where the message came from so Muse can
 // reply to the right channel via POST /send.
-export function buildForwardRequest(message, botUserId) {
-  if (!shouldForwardMessage(message, botUserId)) return null;
+export function buildForwardRequest(message, botUserId, opts = {}) {
+  if (!shouldForwardMessage(message, botUserId, opts)) return null;
   if (typeof message.id !== "string" || !message.id) return null;
   if (typeof message.channel_id !== "string" || !message.channel_id) return null;
   let content = message.content;
@@ -327,9 +470,10 @@ export function buildForwardRequest(message, botUserId) {
 // A second, independent copy of the main guild channel's conversation
 // for Hermes. The scope is deliberately narrow: ONE channel (the
 // owner's main channel in the 放送局 guild), human authors only, and
-// only messages that mention neither hosted bot — anything mentioning
-// croissand or ichihime belongs to the existing forwarding routes
-// above, never to this feed. The gateway's whole job here is to
+// only messages that mention or name-call neither hosted bot —
+// anything addressed to croissand, ichihime, or tako belongs to that
+// bot's forwarding route, never to this feed. The gateway's whole job
+// here is to
 // duplicate, deduplicate and hold (see ambientDeliveryTime); whether
 // a copied message deserves a reaction is Hermes' decision, made on
 // its side. Phase 1 is shadow-only: Hermes logs its would-be
@@ -345,7 +489,7 @@ const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
 // a regular forward so Hermes reads both feeds the same way; nothing
 // is stripped, because a mention of either hosted bot already
 // excluded the message.
-export function buildAmbientRequest(message) {
+export function buildAmbientRequest(message, opts = {}) {
   if (!message || typeof message !== "object") return null;
   if (typeof message.content !== "string") return null;
   if (typeof message.id !== "string" || !message.id) return null;
@@ -355,14 +499,19 @@ export function buildAmbientRequest(message) {
   const author = message.author;
   if (!author || typeof author.id !== "string") return null;
   if (author.bot) return null; // hosted bots and third-party bots alike
-  if (
-    author.id === BOT_CONFIGS.croissand.userId ||
-    author.id === BOT_CONFIGS.ichihime.userId
-  ) {
-    return null;
+  const extraIds = Array.isArray(opts.hostedBotUserIds)
+    ? opts.hostedBotUserIds.filter((id) => typeof id === "string" && /^\d{5,32}$/.test(id))
+    : [];
+  for (const config of Object.values(BOT_CONFIGS)) {
+    if (config.userId && author.id === config.userId) return null;
+    if (config.userId && mentionsBot(message, config.userId)) return null;
+    // Name-calls are an owner-only forward. Other members saying the
+    // name are still part of the channel feed.
+    if (author.id === OWNER_USER_ID && nameCallsBot(message.content, config.names)) return null;
   }
-  if (mentionsBot(message, BOT_CONFIGS.croissand.userId)) return null;
-  if (mentionsBot(message, BOT_CONFIGS.ichihime.userId)) return null;
+  for (const id of extraIds) {
+    if (author.id === id || mentionsBot(message, id)) return null;
+  }
   const content = message.content.trim();
   if (!content) return null;
   const username =
@@ -470,7 +619,7 @@ async function sha256Text(text) {
 }
 
 // ---------- forward delivery modes ----------
-// A forward goes in one of two modes:
+// A forward goes in one of three modes:
 //   "claude-hook": signed Standard Webhooks POST to dots-events'
 //     /claude-hook — files a request for Muse. Needs
 //     CLAUDE_HOOK_SECRET.
@@ -478,12 +627,16 @@ async function sha256Text(text) {
 //     Authorization: Bearer <EVENTS_TRIGGER_KEY> — files a request for
 //     the hub's subscribers (dots). This mode exists so dots' side
 //     never holds Muse's /claude-hook secret.
+//   "webhook": unsigned POST to a bot-configured HTTPS URL. tako uses
+//     this for its Grok Bot webhook trigger. Auth is a header, default
+//     Authorization: Bearer <key>.
 // Production delivery always names a bot, and the bot's static config
 // (BOT_CONFIGS) fixes its mode + credential: croissand → claude-hook,
-// ichihime → trigger. The FORWARD_MODE env var is a legacy fallback
-// consulted only when no bot is given (attemptForward's original
-// single-deployment contract, kept for its tests): anything other
-// than the exact string "trigger" selects claude-hook.
+// ichihime → trigger, tako → webhook. The FORWARD_MODE env var is a
+// legacy fallback consulted only when no bot is given
+// (attemptForward's original single-deployment contract, kept for its
+// tests): anything other than the exact string "trigger" selects
+// claude-hook. It never selects webhook mode.
 
 export function forwardMode(env) {
   return env && env.FORWARD_MODE === "trigger" ? "trigger" : "claude-hook";
@@ -539,13 +692,74 @@ function forwardTarget(env, bot, modeOverride) {
 //   { delivered, final, error, retryAfterMs }
 // - delivered: the receiver accepted the request (HTTP 2xx).
 // - final: retrying the identical body can never succeed, so the
-//   caller drops the row now instead of at the attempt cap. Only
-//   trigger mode produces this (a non-429 4xx rejects the request
+//   caller drops the row now instead of at the attempt cap. Trigger
+//   and webhook modes produce this (a non-429 4xx rejects the request
 //   itself); claude-hook mode retries every failure to the cap,
 //   exactly as before.
 // - retryAfterMs: the receiver's 429 delay hint, when one was given.
+async function classifyForwardResponse(res, requestId, label) {
+  if (res.ok) {
+    await res.body?.cancel();
+    return { delivered: true, final: false, error: null, retryAfterMs: null };
+  }
+  const error = `${label} HTTP ${res.status} for ${requestId}`;
+  if (res.status === 429) {
+    let bodyJson = null;
+    try {
+      bodyJson = await res.json();
+    } catch (_) {
+      /* no JSON body; fall back to the headers */
+    }
+    const seconds = parseRetryAfterSeconds({
+      body: bodyJson,
+      headers: res.headers,
+    });
+    return {
+      delivered: false,
+      final: false,
+      error,
+      retryAfterMs: seconds !== null ? Math.ceil(seconds * 1000) : null,
+    };
+  }
+  await res.body?.cancel();
+  const final = res.status >= 400 && res.status < 500;
+  return { delivered: false, final, error, retryAfterMs: null };
+}
+
 export async function attemptForward({ env, bot, mode: modeOverride, fetchImpl, requestId, body }) {
   const { mode, secret } = forwardTarget(env, bot, modeOverride);
+  if (mode === "webhook") {
+    const config = knownBot(bot) ? BOT_CONFIGS[bot] : null;
+    const target = webhookTarget(env, config);
+    if (!target) {
+      return {
+        delivered: false,
+        final: true,
+        error: `webhook not configured for ${requestId}`,
+        retryAfterMs: null,
+      };
+    }
+    try {
+      const res = await fetchImpl(target.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          [target.headerName]: target.headerValue,
+        },
+        body,
+        redirect: "manual",
+        signal: AbortSignal.timeout(10000),
+      });
+      return await classifyForwardResponse(res, requestId, "webhook");
+    } catch (_) {
+      return {
+        delivered: false,
+        final: false,
+        error: `webhook request failed for ${requestId}`,
+        retryAfterMs: null,
+      };
+    }
+  }
   if (mode === "trigger") {
     try {
       const res = await fetchImpl(EVENTS_TRIGGER_URL, {
@@ -854,14 +1068,18 @@ export function handleGatewayPayload(inputState, payload, opts = {}) {
         state.lastError = null;
       } else if (payload.t === "MESSAGE_CREATE") {
         state.lastMessageAt = now;
-        const request = buildForwardRequest(d, state.botUserId);
+        const names = knownBot(opts.botKey) ? BOT_CONFIGS[opts.botKey].names : undefined;
+        const request = buildForwardRequest(d, state.botUserId, { names });
         if (request) actions.push({ type: "forward", request });
         // The ambient shadow copy is computed for every bot's stream
         // (this machine is bot-agnostic), but the Durable Object only
-        // enqueues it from croissand's stream: both bots see the same
+        // enqueues it from croissand's stream: every bot sees the same
         // guild message, and one copy is enough — the (bot,
-        // request_id) outbox/forward_log keys do the rest.
-        const ambient = buildAmbientRequest(d);
+        // request_id) outbox/forward_log keys do the rest. Name-calls
+        // and learned user ids keep a hosted bot's messages off the feed.
+        const ambient = buildAmbientRequest(d, {
+          hostedBotUserIds: opts.hostedBotUserIds,
+        });
         if (ambient) actions.push({ type: "ambient", request: ambient });
       }
       break;
@@ -1541,8 +1759,15 @@ export class Gateway extends DurableObject {
       }
       const state = this.loadState(botKey);
       const receivedAt = Date.now();
+      const hostedBotUserIds = [];
+      for (const key of BOT_KEYS) {
+        const id = key === botKey ? state.botUserId : this.loadState(key).botUserId;
+        if (typeof id === "string" && /^\d{5,32}$/.test(id)) hostedBotUserIds.push(id);
+      }
       const { state: nextState, actions } = handleGatewayPayload(state, payload, {
         now: receivedAt,
+        botKey,
+        hostedBotUserIds,
       });
       if (!actions.some(action => action.type === "close_socket")) nextState.connected = true;
       this.saveState(nextState, botKey);
@@ -1991,8 +2216,8 @@ export class Gateway extends DurableObject {
             botKey, row.request_id
           );
           if (ok || result.final) {
-            // forward_log dedups replays for a week. A final trigger
-            // failure (non-429 4xx) is logged here as failed — the
+            // forward_log dedups replays for a week. A final trigger or
+            // webhook failure (non-429 4xx) is logged here as failed — the
             // request can never be filed, so a replay must not file
             // it again — and counted as dropped below.
             this.ctx.storage.sql.exec(

@@ -137,10 +137,10 @@ async function completesPromptly(promise, message) {
 
 // ---------- bot registry ----------
 
-test("registry: bot configs match the two production bots", () => {
+test("registry: bot configs match the hosted production bots", () => {
   const hooks = pure.__testHooks();
   assert.equal(hooks.PRIMARY_BOT, "croissand");
-  assert.deepEqual(hooks.BOT_KEYS, ["croissand", "ichihime"]);
+  assert.deepEqual(hooks.BOT_KEYS, ["croissand", "ichihime", "tako"]);
   const c = hooks.BOT_CONFIGS.croissand;
   assert.equal(c.tokenEnv, "DISCORD_BOT_TOKEN");
   assert.equal(c.forwardMode, "claude-hook");
@@ -151,6 +151,14 @@ test("registry: bot configs match the two production bots", () => {
   assert.equal(i.forwardMode, "trigger");
   assert.equal(i.forwardSecretEnv, "EVENTS_TRIGGER_KEY");
   assert.equal(i.userId, "1568548424519913482");
+  const t = hooks.BOT_CONFIGS.tako;
+  assert.equal(t.tokenEnv, "DISCORD_BOT_TOKEN_TAKO");
+  assert.equal(t.forwardMode, "webhook");
+  assert.equal(t.forwardSecretEnv, "TAKO_WEBHOOK_KEY");
+  assert.equal(t.webhookUrlEnv, "TAKO_WEBHOOK_URL");
+  assert.equal(t.webhookAuthHeaderEnv, "TAKO_WEBHOOK_AUTH_HEADER");
+  assert.deepEqual(t.names, ["たこ", "たこ · 秘書", "tako"]);
+  assert.equal(t.userId, null);
   assert.equal(
     pure.botConfigured(
       { DISCORD_BOT_TOKEN: "t", CLAUDE_HOOK_SECRET: "s" },

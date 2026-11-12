@@ -22,6 +22,13 @@ new_sqlite_classes = ["Gateway"]
 #                               POST /claude-hook receiver (croissand)
 #   EVENTS_TRIGGER_KEY          Bearer key for dots-events' POST /trigger
 #                               (ichihime; set only when enabling her)
+#   DISCORD_BOT_TOKEN_TAKO      tako's Discord bot token
+#                               (set only when enabling tako)
+#   TAKO_WEBHOOK_URL            HTTPS URL of tako's Grok Bot webhook
+#   TAKO_WEBHOOK_KEY            credential sent with tako's webhook POST
+#   TAKO_WEBHOOK_AUTH_HEADER    optional header name for TAKO_WEBHOOK_KEY
+#                               (default Authorization: Bearer <key>;
+#                               any other name sends the raw key)
 #   ADMIN_KEY                   admin key for POST /connect, /send, /avatar
 #
 # Vars:
@@ -30,8 +37,11 @@ new_sqlite_classes = ["Gateway"]
 #
 # Endpoints (once routed/deployed):
 #   GET  /status   public: {"connected", "ready"} for croissand plus a
-#                  per-bot "bots" detail (connected/ready/configured)
+#                  per-bot "bots" detail (connected/ready/configured),
+#                  including bots.tako
 #   POST /connect  admin key: nudge the Durable Object to (re)connect
-#                  (optional {"bot": "ichihime"} targets one bot)
+#                  (optional {"bot": "ichihime"} or {"bot": "tako"}
+#                  targets one bot)
 #   POST /send     admin key: post a message to a Discord channel
-#                  (optional {"bot": "ichihime"} picks the sender)
+#                  (optional {"bot": "ichihime"} or {"bot": "tako"}
+#                  picks the sender)
